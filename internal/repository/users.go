@@ -8,11 +8,11 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const userColumns = `id, username, password_hash, nickname, bio, created_at, updated_at`
+const userColumns = `id, username, password_hash, nickname, bio, email, quota_bytes, created_at, updated_at`
 
 func scanUser(row pgx.Row) (model.User, error) {
 	var u model.User
-	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Nickname, &u.Bio, &u.CreatedAt, &u.UpdatedAt)
+	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Nickname, &u.Bio, &u.Email, &u.QuotaBytes, &u.CreatedAt, &u.UpdatedAt)
 	return u, translate(err)
 }
 
@@ -23,6 +23,16 @@ func (s *Store) CreateUser(ctx context.Context, username, passwordHash, nickname
 		 VALUES ($1, $2, $3)
 		 RETURNING `+userColumns,
 		username, passwordHash, nickname)
+	return scanUser(row)
+}
+
+// CreateUserWithQuota 插入新用户并指定邮箱与配额上限。
+func (s *Store) CreateUserWithQuota(ctx context.Context, username, passwordHash, nickname, email string, quotaBytes int64) (model.User, error) {
+	row := s.pool.QueryRow(ctx,
+		`INSERT INTO users (username, password_hash, nickname, email, quota_bytes)
+		 VALUES ($1, $2, $3, $4, $5)
+		 RETURNING `+userColumns,
+		username, passwordHash, nickname, email, quotaBytes)
 	return scanUser(row)
 }
 

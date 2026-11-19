@@ -24,6 +24,7 @@ func (t *Tokens) Issue(userID uuid.UUID) (string, time.Time, error) {
 	expiresAt := now.Add(t.ttl)
 
 	claims := jwt.RegisteredClaims{
+		ID:        uuid.NewString(),
 		Subject:   userID.String(),
 		IssuedAt:  jwt.NewNumericDate(now),
 		ExpiresAt: jwt.NewNumericDate(expiresAt),
@@ -42,7 +43,7 @@ func (t *Tokens) Parse(raw string) (uuid.UUID, error) {
 	var claims jwt.RegisteredClaims
 	_, err := jwt.ParseWithClaims(raw, &claims,
 		func(*jwt.Token) (any, error) { return t.secret, nil },
-		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}), jwt.WithExpirationRequired())
 	if err != nil {
 		return uuid.Nil, err
 	}

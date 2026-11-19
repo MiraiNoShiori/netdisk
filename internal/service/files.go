@@ -21,7 +21,7 @@ import (
 
 const maxNameLen = 255
 
-// Files 实现文件的上传、下载、改名、删除与列表。
+// Files 实现文件的上传、下载、改名、删除、回收站、检索与打包下载。
 type Files struct {
 	store   *repository.Store
 	storage storage.Storage
@@ -31,6 +31,24 @@ type Files struct {
 
 func NewFiles(store *repository.Store, st storage.Storage, backend string, logger *slog.Logger) *Files {
 	return &Files{store: store, storage: st, backend: backend, logger: logger}
+}
+
+// checkQuota 校验用户新增 delta 字节后是否超过存储配额；quota <= 0 表示不限制。
+func checkQuota(ctx context.Context, store *repository.Store, ownerID uuid.UUID, delta int64) error {
+	if delta <= 0 {
+		return nil
+	}
+	used, quota, err := store.GetUserUsageAndQuota(ctx, ownerID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if quota > 0 && used+delta > quota {
+		return ErrQuotaExceeded
+	}
+	return nil
 }
 
 // UploadInput 是一次上传。Body 尚未读完，Upload 会在读取过程中写入存储。
@@ -51,6 +69,11 @@ func (f *Files) Upload(ctx context.Context, in UploadInput) (model.Node, error) 
 	if err := f.checkParent(ctx, in.OwnerID, in.ParentID); err != nil {
 		return model.Node{}, err
 	}
+	if in.SizeHint > 0 {
+		if err := checkQuota(ctx, f.store, in.OwnerID, in.SizeHint); err != nil {
+			return model.Node{}, err
+		}
+	}
 
 	// 先写自己专属的 key，避免并发上传互相覆盖。
 	key := "blobs/" + uuid.NewString()
@@ -59,6 +82,12 @@ func (f *Files) Upload(ctx context.Context, in UploadInput) (model.Node, error) 
 	hash, err := f.storage.Put(ctx, key, counted, in.SizeHint)
 	if err != nil {
 		return model.Node{}, fmt.Errorf("write content: %w", err)
+	}
+
+	// 未知长度的流式上传读完后再用真实字节数做配额兜底校验。
+	if err := checkQuota(ctx, f.store, in.OwnerID, counted.n); err != nil {
+		_ = f.storage.Delete(ctx, key)
+		return model.Node{}, err
 	}
 
 	blob, recorded, err := f.store.UpsertBlob(ctx, hash, counted.n, f.backend, key)
@@ -84,6 +113,7 @@ func (f *Files) Upload(ctx context.Context, in UploadInput) (model.Node, error) 
 		}
 		return model.Node{}, err
 	}
+	node.Backend = blob.Backend
 	return node, nil
 }
 
@@ -127,8 +157,11 @@ func (f *Files) InstantUpload(ctx context.Context, in InstantInput) (model.Node,
 	if err != nil {
 		return model.Node{}, err
 	}
-	if in.Size > 0 && in.Size != blob.Size {
+	if in.Size != blob.Size {
 		return model.Node{}, invalid("size 与已存内容的实际大小不符")
+	}
+	if err := checkQuota(ctx, f.store, in.OwnerID, blob.Size); err != nil {
+		return model.Node{}, err
 	}
 
 	node, err := f.store.CreateNode(ctx, in.OwnerID, in.ParentID, name, false, blob.Size, &blob.ID)
@@ -138,6 +171,7 @@ func (f *Files) InstantUpload(ctx context.Context, in InstantInput) (model.Node,
 	if err != nil {
 		return model.Node{}, err
 	}
+	node.Backend = blob.Backend
 	return node, nil
 }
 
@@ -147,6 +181,59 @@ func (f *Files) List(ctx context.Context, ownerID uuid.UUID, parentID *uuid.UUID
 		return nil, err
 	}
 	return f.store.ListChildren(ctx, ownerID, parentID)
+}
+
+// ListResult 封装支持分页、排序与搜索的文件查询结果。
+type ListResult struct {
+	Nodes   []model.Node
+	Total   int64
+	Limit   int
+	Offset  int
+	HasMore bool
+}
+
+// Query 按目录、关键词、类型、排序和分页条件查询文件列表。
+func (f *Files) Query(ctx context.Context, ownerID uuid.UUID, opts repository.ListFilesOptions) (ListResult, error) {
+	if opts.FilterByDir {
+		if err := f.checkParent(ctx, ownerID, opts.ParentID); err != nil {
+			return ListResult{}, err
+		}
+	}
+	if opts.Limit < 0 || opts.Limit > 500 {
+		return ListResult{}, invalid("limit 必须在 0 到 500 之间")
+	}
+	if opts.Offset < 0 {
+		return ListResult{}, invalid("offset 不能为负")
+	}
+	nodes, total, err := f.store.QueryNodes(ctx, ownerID, opts)
+	if err != nil {
+		return ListResult{}, err
+	}
+	hasMore := opts.Limit > 0 && int64(opts.Offset+len(nodes)) < total
+	return ListResult{
+		Nodes:   nodes,
+		Total:   total,
+		Limit:   opts.Limit,
+		Offset:  opts.Offset,
+		HasMore: hasMore,
+	}, nil
+}
+
+// ListFolders 返回用户所有存活目录，供前端目录树选择器使用。
+func (f *Files) ListFolders(ctx context.Context, ownerID uuid.UUID) ([]model.Node, error) {
+	return f.store.ListAllFolders(ctx, ownerID)
+}
+
+// Ancestors 返回某节点自顶向下的祖先链，供面包屑导航定位。
+func (f *Files) Ancestors(ctx context.Context, ownerID, id uuid.UUID) ([]model.Node, error) {
+	chain, err := f.store.ListNodeAncestors(ctx, ownerID, id)
+	if err != nil {
+		return nil, err
+	}
+	if len(chain) == 0 {
+		return nil, ErrNotFound
+	}
+	return chain, nil
 }
 
 // CreateDir 新建文件夹。
@@ -216,8 +303,7 @@ func (f *Files) Update(ctx context.Context, ownerID, id uuid.UUID, in UpdateInpu
 	return node, nil
 }
 
-// Delete 软删节点，删文件夹时连同整棵子树一起。
-// 删除后回收不再被任何节点引用的内容；回收失败不影响删除结果，只记日志。
+// Delete 将节点及其子树移入回收站（软删）；底层内容块保留，直到从回收站彻底删除或过期清理。
 func (f *Files) Delete(ctx context.Context, ownerID, id uuid.UUID) error {
 	if err := f.store.SoftDeleteSubtree(ctx, ownerID, id); err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
@@ -225,19 +311,89 @@ func (f *Files) Delete(ctx context.Context, ownerID, id uuid.UUID) error {
 		}
 		return err
 	}
+	return nil
+}
 
-	keys, err := f.store.ReclaimOrphanBlobs(ctx, ownerID, id)
+// DeletePermanent 跳过回收站立即彻底删除节点及其子树，并回收无引用内容块。
+func (f *Files) DeletePermanent(ctx context.Context, ownerID, id uuid.UUID) error {
+	locs, err := f.store.PurgeLiveSubtreeAndReclaim(ctx, ownerID, id)
 	if err != nil {
-		f.logger.Warn("reclaim orphan blobs after delete", "node_id", id, "error", err)
+		return mapNotFound(err)
+	}
+	f.deleteReclaimedObjects(ctx, locs)
+	return nil
+}
+
+// ListTrash 列出用户回收站中的顶层项目。
+func (f *Files) ListTrash(ctx context.Context, ownerID uuid.UUID) ([]model.Node, error) {
+	return f.store.ListTrash(ctx, ownerID)
+}
+
+// RestoreTrash 从回收站恢复某项及其整棵子树；若目标目录同名冲突返回 ErrNameConflict。
+func (f *Files) RestoreTrash(ctx context.Context, ownerID, id uuid.UUID, targetParent *uuid.UUID, overrideParent bool) (model.Node, error) {
+	if overrideParent {
+		if err := f.checkParent(ctx, ownerID, targetParent); err != nil {
+			return model.Node{}, err
+		}
+	}
+	node, err := f.store.RestoreTrashSubtree(ctx, ownerID, id, targetParent, overrideParent)
+	switch {
+	case errors.Is(err, repository.ErrUniqueViolation):
+		return model.Node{}, ErrNameConflict
+	case errors.Is(err, repository.ErrNotFound):
+		return model.Node{}, ErrNotFound
+	case err != nil:
+		return model.Node{}, err
+	}
+	return node, nil
+}
+
+// PurgeTrashItem 彻底删除回收站中的单项（连同子树）并回收孤儿内容块。
+func (f *Files) PurgeTrashItem(ctx context.Context, ownerID, id uuid.UUID) error {
+	locs, err := f.store.PurgeTrashSubtree(ctx, ownerID, id)
+	if err != nil {
+		return mapNotFound(err)
+	}
+	f.deleteReclaimedObjects(ctx, locs)
+	return nil
+}
+
+// EmptyTrash 清空当前用户全部回收站内容并回收孤儿内容块。
+func (f *Files) EmptyTrash(ctx context.Context, ownerID uuid.UUID) error {
+	locs, err := f.store.PurgeAllTrash(ctx, ownerID)
+	if err != nil {
+		return err
+	}
+	f.deleteReclaimedObjects(ctx, locs)
+	return nil
+}
+
+// PurgeExpiredTrash 供后台维护任务定期彻底清理超过保留期限的回收站记录。
+func (f *Files) PurgeExpiredTrash(ctx context.Context, retention time.Duration) error {
+	if retention <= 0 {
 		return nil
 	}
-	for _, key := range keys {
-		if err := f.storage.Delete(ctx, key); err != nil && !errors.Is(err, storage.ErrNotFound) {
-			// 行已删、对象没删掉，只会在磁盘上留下垃圾，不影响读路径。
+	locs, err := f.store.PurgeExpiredTrash(ctx, time.Now().Add(-retention), 200)
+	if err != nil {
+		return err
+	}
+	f.deleteReclaimedObjects(ctx, locs)
+	return nil
+}
+
+func (f *Files) deleteReclaimedObjects(ctx context.Context, locs []repository.BlobLocation) {
+	for _, key := range locs {
+		st, selectErr := storage.For(f.storage, key.Backend)
+		if selectErr != nil {
+			f.logger.Warn("missing reclaimed backend", "error", selectErr)
+			_ = f.store.QueueObject(ctx, key.Backend, key.Key)
+			continue
+		}
+		if err := st.Delete(ctx, key.Key); err != nil && !errors.Is(err, storage.ErrNotFound) {
+			_ = f.store.QueueObject(ctx, key.Backend, key.Key)
 			f.logger.Warn("delete reclaimed object", "key", key, "error", err)
 		}
 	}
-	return nil
 }
 
 // Download 是一次下载需要的全部东西。
@@ -248,7 +404,7 @@ type Download struct {
 	Content io.ReadSeekCloser // 必须可 Seek：http.ServeContent 依赖它支持 Range
 }
 
-// OpenDownload 打开一个文件供下载；所有权校验由 GetNode 完成。
+// OpenDownload 打开一个文件供下载；所有权校验由 GetNode 完成，同时累计内容热度。
 func (f *Files) OpenDownload(ctx context.Context, ownerID, id uuid.UUID) (Download, error) {
 	node, err := f.store.GetNode(ctx, ownerID, id)
 	if errors.Is(err, repository.ErrNotFound) {
@@ -266,12 +422,16 @@ func (f *Files) OpenDownload(ctx context.Context, ownerID, id uuid.UUID) (Downlo
 		return Download{}, err
 	}
 
-	rc, _, err := f.storage.Open(ctx, blob.StorageKey)
+	rc, _, err := storage.OpenFrom(ctx, f.storage, blob.Backend, blob.StorageKey)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return Download{}, ErrNotFound
 		}
 		return Download{}, err
+	}
+	// 热度计数失败不阻断下载。
+	if err := f.store.RecordBlobDownload(ctx, blob.ID); err != nil {
+		f.logger.Warn("record blob download", "blob_id", blob.ID, "error", err)
 	}
 	return Download{Name: node.Name, Size: blob.Size, ModTime: node.UpdatedAt, Content: rc}, nil
 }
@@ -284,8 +444,8 @@ type ZipDownload struct {
 
 // OpenZip 打开一个文件夹的打包下载。
 //
-// 校验（节点存在、属于调用者、是目录）在返回前完成；遍历打包经 io.Pipe 在后台进行，
-// 开始输出字节后的错误只能通过流传递给读端。
+// 校验（节点存在、属于调用者、是目录）与整棵子树元数据查询在返回前一次完成（消除 N+1 查询）；
+// 随后经 io.Pipe 在后台流式写入各个文件内容，内存仍保持 O(1)。
 func (f *Files) OpenZip(ctx context.Context, ownerID, id uuid.UUID) (ZipDownload, error) {
 	root, err := f.store.GetNode(ctx, ownerID, id)
 	if errors.Is(err, repository.ErrNotFound) {
@@ -298,11 +458,16 @@ func (f *Files) OpenZip(ctx context.Context, ownerID, id uuid.UUID) (ZipDownload
 		return ZipDownload{}, ErrNotADirectory
 	}
 
+	entries, err := f.store.ListSubtreeWithBlobs(ctx, ownerID, root.ID)
+	if err != nil {
+		return ZipDownload{}, err
+	}
+
 	pr, pw := io.Pipe()
 	go func() {
 		zw := zip.NewWriter(pw)
 		// 出错时不再调用 zw.Close：否则读端会拿到一个空但合法的 zip。
-		if err := f.writeZip(ctx, zw, root); err != nil {
+		if err := f.writeZipEntries(ctx, zw, entries); err != nil {
 			_ = pw.CloseWithError(err)
 			return
 		}
@@ -316,96 +481,56 @@ func (f *Files) OpenZip(ctx context.Context, ownerID, id uuid.UUID) (ZipDownload
 	return ZipDownload{Name: root.Name + ".zip", Content: pr}, nil
 }
 
-// writeZip 把 root 的整棵子树写进 zw，条目名以 root.Name + "/" 为前缀。
-func (f *Files) writeZip(ctx context.Context, zw *zip.Writer, root model.Node) error {
-	rootPrefix := strings.Trim(root.Name, "/") + "/"
-	rootHeader := &zip.FileHeader{
-		Name:     rootPrefix,
-		Method:   zip.Store,
-		Modified: root.UpdatedAt,
-	}
-	if _, err := zw.CreateHeader(rootHeader); err != nil {
-		return fmt.Errorf("create root dir entry: %w", err)
-	}
-
-	var walk func(parentID *uuid.UUID, currentPrefix string) error
-	walk = func(parentID *uuid.UUID, currentPrefix string) error {
+// writeZipEntries 顺序将子树条目流式写入 zw。
+func (f *Files) writeZipEntries(ctx context.Context, zw *zip.Writer, entries []model.ZipEntry) error {
+	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if entry.IsDir {
+			dirHeader := &zip.FileHeader{
+				Name:     strings.Trim(entry.RelPath, "/") + "/",
+				Method:   zip.Store,
+				Modified: entry.UpdatedAt,
+			}
+			if _, err := zw.CreateHeader(dirHeader); err != nil {
+				return fmt.Errorf("create dir entry: %w", err)
+			}
+			continue
+		}
 
-		children, err := f.store.ListChildren(ctx, root.OwnerID, parentID)
+		fileHeader := &zip.FileHeader{
+			Name:     strings.TrimPrefix(entry.RelPath, "/"),
+			Method:   getCompressionMethod(entry.RelPath),
+			Modified: entry.UpdatedAt,
+		}
+		writer, err := zw.CreateHeader(fileHeader)
 		if err != nil {
+			return fmt.Errorf("create file entry: %w", err)
+		}
+		if entry.StorageKey == "" {
+			continue
+		}
+		if err := func() error {
+			reader, _, err := storage.OpenFrom(ctx, f.storage, entry.Backend, entry.StorageKey)
+			if err != nil {
+				return fmt.Errorf("open file content: %w", err)
+			}
+			defer reader.Close()
+			_, err = io.Copy(writer, reader)
 			return err
+		}(); err != nil {
+			return fmt.Errorf("write file content: %w", err)
 		}
-
-		for _, child := range children {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-
-			childPrefix := currentPrefix + child.Name
-
-			if child.IsDir {
-				dirHeader := &zip.FileHeader{
-					Name:     childPrefix + "/",
-					Method:   zip.Store,
-					Modified: child.UpdatedAt,
-				}
-				if _, err := zw.CreateHeader(dirHeader); err != nil {
-					return fmt.Errorf("create dir entry: %w", err)
-				}
-				childID := child.ID
-				if err := walk(&childID, childPrefix+"/"); err != nil {
-					return err
-				}
-			} else {
-				fileHeader := &zip.FileHeader{
-					Name:     childPrefix,
-					Method:   getCompressionMethod(child.Name),
-					Modified: child.UpdatedAt,
-				}
-
-				writer, err := zw.CreateHeader(fileHeader)
-				if err != nil {
-					return fmt.Errorf("create file entry: %w", err)
-				}
-
-				if child.BlobID == nil {
-					continue
-				}
-
-				blob, err := f.store.GetBlobByID(ctx, *child.BlobID)
-				if err != nil {
-					return fmt.Errorf("get blob: %w", err)
-				}
-
-				if err := func() error {
-					reader, _, err := f.storage.Open(ctx, blob.StorageKey)
-					if err != nil {
-						return fmt.Errorf("open file content: %w", err)
-					}
-					defer reader.Close()
-
-					_, err = io.Copy(writer, reader)
-					return err
-				}(); err != nil {
-					return fmt.Errorf("write file content: %w", err)
-				}
-			}
-		}
-		return nil
 	}
-
-	rootID := root.ID
-	return walk(&rootID, rootPrefix)
+	return nil
 }
 
 // getCompressionMethod 按扩展名挑压缩方式：已压缩的格式直接 Store，其余 Deflate。
 func getCompressionMethod(name string) uint16 {
 	ext := strings.ToLower(path.Ext(name))
 	switch ext {
-	case ".jpg", ".png", ".gif", ".zip", ".mp4", ".mp3":
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".zip", ".gz", ".7z", ".mp4", ".webm", ".mp3", ".aac":
 		return zip.Store
 	default:
 		return zip.Deflate
@@ -435,6 +560,9 @@ func cleanName(raw string) (string, error) {
 	name := path.Base(strings.TrimSpace(raw))
 	if name == "" || name == "." || name == "/" || name == ".." {
 		return "", invalid("文件名不能为空")
+	}
+	if strings.ContainsAny(name, "\x00\r\n") {
+		return "", invalid("文件名含有控制字符")
 	}
 	if len(name) > maxNameLen {
 		return "", invalid("文件名最长 %d 字节", maxNameLen)

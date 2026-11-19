@@ -11,13 +11,14 @@ import (
 	"github.com/google/uuid"
 )
 
-// createUploadRequest 是 POST /uploads 的请求体。
+// createUploadRequest 是 POST /uploads 的请求体，同时兼容 hash 与 content_hash 字段名。
 type createUploadRequest struct {
-	Name      string `json:"name"`
-	ParentID  string `json:"parent_id"`
-	TotalSize int64  `json:"total_size"`
-	ChunkSize int64  `json:"chunk_size"`
-	Hash      string `json:"hash"` // 可选：客户端预申报整份 SHA-256
+	Name        string `json:"name"`
+	ParentID    string `json:"parent_id"`
+	TotalSize   int64  `json:"total_size"`
+	ChunkSize   int64  `json:"chunk_size"`
+	Hash        string `json:"hash"`         // 可选：客户端预申报整份 SHA-256
+	ContentHash string `json:"content_hash"` // 文档兼容别名
 }
 
 // createUpload 开一个分片会话，返回 session id + 分片数。
@@ -38,9 +39,19 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 		httpx.Fail(w, r, s.deps.Logger, httpx.Invalid(err.Error()))
 		return
 	}
+	h1 := strings.ToLower(strings.TrimSpace(req.Hash))
+	h2 := strings.ToLower(strings.TrimSpace(req.ContentHash))
+	if h1 != "" && h2 != "" && h1 != h2 {
+		httpx.Fail(w, r, s.deps.Logger, httpx.Invalid("hash 与 content_hash 不一致"))
+		return
+	}
+	rawHash := h1
+	if rawHash == "" {
+		rawHash = h2
+	}
 	var contentHash *string
-	if h := strings.ToLower(strings.TrimSpace(req.Hash)); h != "" {
-		contentHash = &h
+	if rawHash != "" {
+		contentHash = &rawHash
 	}
 
 	sess, err := s.deps.Uploads.Create(r.Context(), service.CreateInput{

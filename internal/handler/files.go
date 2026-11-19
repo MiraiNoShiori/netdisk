@@ -9,10 +9,13 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"path"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Miraitowa-kawayi/netdisk/internal/httpx"
+	"github.com/Miraitowa-kawayi/netdisk/internal/repository"
 	"github.com/Miraitowa-kawayi/netdisk/internal/service"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -143,15 +146,19 @@ func parseParentID(raw string) (*uuid.UUID, error) {
 }
 
 type fileItem struct {
-	ID          uuid.UUID `json:"id"`
-	Name        string    `json:"name"`
-	IsDir       bool      `json:"is_dir"`
-	Size        int64     `json:"size"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
-	DownloadURL string    `json:"download_url,omitempty"`
+	ID            uuid.UUID  `json:"id"`
+	ParentID      *uuid.UUID `json:"parent_id"`
+	Name          string     `json:"name"`
+	IsDir         bool       `json:"is_dir"`
+	Size          int64      `json:"size"`
+	Backend       string     `json:"backend,omitempty"`
+	DownloadCount int64      `json:"download_count,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	DownloadURL   string     `json:"download_url,omitempty"`
 }
 
+// listFiles 支持按目录浏览、全树搜索（?q=）、类型过滤（?type=file|dir）、排序（?sort=&order=）与分页（?limit=&offset=）。
 func (s *Server) listFiles(w http.ResponseWriter, r *http.Request) {
 	uid, ok := userID(r)
 	if !ok {
@@ -159,34 +166,109 @@ func (s *Server) listFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	parentID, err := parseParentID(r.URL.Query().Get("parent_id"))
+	qv := r.URL.Query()
+	parentID, err := parseParentID(qv.Get("parent_id"))
 	if err != nil {
 		httpx.Fail(w, r, s.deps.Logger, httpx.Invalid(err.Error()))
 		return
 	}
 
-	nodes, err := s.deps.Files.List(r.Context(), uid, parentID)
+	limit := 0
+	if raw := strings.TrimSpace(qv.Get("limit")); raw != "" {
+		limit, err = strconv.Atoi(raw)
+		if err != nil {
+			httpx.Fail(w, r, s.deps.Logger, httpx.Invalid("limit 必须是整数"))
+			return
+		}
+	}
+	offset := 0
+	if raw := strings.TrimSpace(qv.Get("offset")); raw != "" {
+		offset, err = strconv.Atoi(raw)
+		if err != nil {
+			httpx.Fail(w, r, s.deps.Logger, httpx.Invalid("offset 必须是整数"))
+			return
+		}
+	}
+
+	searchQ := strings.TrimSpace(qv.Get("q"))
+	// 有搜索词且未显式限定 scope=dir 时执行全树搜索，便于跨目录快速找文件。
+	filterByDir := searchQ == "" || strings.EqualFold(qv.Get("scope"), "dir")
+
+	res, err := s.deps.Files.Query(r.Context(), uid, repository.ListFilesOptions{
+		ParentID:    parentID,
+		FilterByDir: filterByDir,
+		Query:       searchQ,
+		Type:        strings.ToLower(strings.TrimSpace(qv.Get("type"))),
+		Sort:        strings.ToLower(strings.TrimSpace(qv.Get("sort"))),
+		Order:       strings.ToLower(strings.TrimSpace(qv.Get("order"))),
+		Limit:       limit,
+		Offset:      offset,
+	})
 	if err != nil {
 		s.failService(w, r, err)
 		return
 	}
 
-	items := make([]fileItem, 0, len(nodes))
-	for _, n := range nodes {
+	items := make([]fileItem, 0, len(res.Nodes))
+	for _, n := range res.Nodes {
 		item := fileItem{
-			ID:        n.ID,
-			Name:      n.Name,
-			IsDir:     n.IsDir,
-			Size:      n.Size,
-			CreatedAt: n.CreatedAt,
-			UpdatedAt: n.UpdatedAt,
+			ID:            n.ID,
+			ParentID:      n.ParentID,
+			Name:          n.Name,
+			IsDir:         n.IsDir,
+			Size:          n.Size,
+			Backend:       n.Backend,
+			DownloadCount: n.DownloadCount,
+			CreatedAt:     n.CreatedAt,
+			UpdatedAt:     n.UpdatedAt,
 		}
 		if !n.IsDir {
 			item.DownloadURL = "/api/v1/files/" + n.ID.String() + "/download"
 		}
 		items = append(items, item)
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"files": items})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+		"files":    items,
+		"total":    res.Total,
+		"limit":    res.Limit,
+		"offset":   res.Offset,
+		"has_more": res.HasMore,
+	})
+}
+
+// listFolders 返回当前用户所有文件夹，供前端移动文件时展示可视化目录树。
+func (s *Server) listFolders(w http.ResponseWriter, r *http.Request) {
+	uid, ok := userID(r)
+	if !ok {
+		httpx.Fail(w, r, s.deps.Logger, httpx.Unauthorized("authentication required"))
+		return
+	}
+	folders, err := s.deps.Files.ListFolders(r.Context(), uid)
+	if err != nil {
+		s.failService(w, r, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"folders": folders})
+}
+
+// fileAncestors 返回节点从根目录向下的祖先链，用于搜索定位后的面包屑恢复。
+func (s *Server) fileAncestors(w http.ResponseWriter, r *http.Request) {
+	uid, ok := userID(r)
+	if !ok {
+		httpx.Fail(w, r, s.deps.Logger, httpx.Unauthorized("authentication required"))
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Fail(w, r, s.deps.Logger, httpx.NotFound("no such file"))
+		return
+	}
+	chain, err := s.deps.Files.Ancestors(r.Context(), uid, id)
+	if err != nil {
+		s.failService(w, r, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ancestors": chain})
 }
 
 func (s *Server) downloadFile(w http.ResponseWriter, r *http.Request) {
@@ -209,11 +291,55 @@ func (s *Server) downloadFile(w http.ResponseWriter, r *http.Request) {
 	}
 	defer dl.Content.Close()
 
+	serveDownload(w, r, dl)
+}
+
+// serveDownload 统一处理下载与安全内联预览（?inline=1），自动保留 Range / 206 断点续传支持。
+func serveDownload(w http.ResponseWriter, r *http.Request, dl service.Download) {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	inlineReq := r.URL.Query().Get("inline") == "1" || strings.EqualFold(r.URL.Query().Get("inline"), "true")
+	if inlineReq {
+		if mimeType, ok := safeInlineMIME(dl.Name); ok {
+			w.Header().Set("Content-Type", mimeType)
+			w.Header().Set("Content-Disposition", contentDispositionMode("inline", dl.Name))
+			http.ServeContent(w, r, dl.Name, dl.ModTime, dl.Content)
+			return
+		}
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", contentDisposition(dl.Name))
-
-	// ServeContent 接受 io.ReadSeeker，Range / If-Range / 206 由它处理。
 	http.ServeContent(w, r, dl.Name, dl.ModTime, dl.Content)
+}
+
+// safeInlineMIME 仅对非脚本类安全媒体与纯文本放行内联预览（严禁 HTML/SVG 以防存储型 XSS）。
+func safeInlineMIME(name string) (string, bool) {
+	switch strings.ToLower(path.Ext(name)) {
+	case ".png":
+		return "image/png", true
+	case ".jpg", ".jpeg":
+		return "image/jpeg", true
+	case ".gif":
+		return "image/gif", true
+	case ".webp":
+		return "image/webp", true
+	case ".pdf":
+		return "application/pdf", true
+	case ".mp4":
+		return "video/mp4", true
+	case ".webm":
+		return "video/webm", true
+	case ".mp3":
+		return "audio/mpeg", true
+	case ".wav":
+		return "audio/wav", true
+	case ".ogg":
+		return "audio/ogg", true
+	case ".txt", ".md", ".markdown", ".json", ".csv", ".log", ".yml", ".yaml", ".toml", ".xml",
+		".go", ".js", ".ts", ".css", ".py", ".rs", ".c", ".cpp", ".h", ".java", ".sh", ".sql", ".ini", ".env":
+		return "text/plain; charset=utf-8", true
+	default:
+		return "", false
+	}
 }
 
 // downloadZip 把文件夹整棵子树打包成 zip 流式下发。
@@ -397,7 +523,13 @@ func (s *Server) deleteFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.deps.Files.Delete(r.Context(), uid, id); err != nil {
+	permanent := r.URL.Query().Get("permanent") == "1" || strings.EqualFold(r.URL.Query().Get("permanent"), "true")
+	if permanent {
+		err = s.deps.Files.DeletePermanent(r.Context(), uid, id)
+	} else {
+		err = s.deps.Files.Delete(r.Context(), uid, id)
+	}
+	if err != nil {
 		s.failService(w, r, err)
 		return
 	}
@@ -406,11 +538,15 @@ func (s *Server) deleteFile(w http.ResponseWriter, r *http.Request) {
 
 // contentDisposition 同时给出 filename= 与 filename*=（RFC 5987），避免中文文件名乱码。
 func contentDisposition(name string) string {
+	return contentDispositionMode("attachment", name)
+}
+
+func contentDispositionMode(mode, name string) string {
 	ascii := strings.Map(func(r rune) rune {
 		if r < 32 || r > 126 || r == '"' || r == '\\' {
 			return '-'
 		}
 		return r
 	}, name)
-	return fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`, ascii, url.PathEscape(name))
+	return fmt.Sprintf(`%s; filename="%s"; filename*=UTF-8''%s`, mode, ascii, url.PathEscape(name))
 }

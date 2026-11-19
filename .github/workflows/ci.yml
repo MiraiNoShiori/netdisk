@@ -1,0 +1,33 @@
+name: verify
+on: [push, pull_request]
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      NETDISK_DATABASE_URL: postgres://netdisk:netdisk@localhost:15433/netdisk_test?sslmode=disable
+      NETDISK_TEST_DATABASE_URL: postgres://netdisk:netdisk@localhost:15433/netdisk_test?sslmode=disable
+      NETDISK_TEST_S3_ENDPOINT: localhost:19000
+      NETDISK_JWT_SECRET: ci-test-only-key
+      NETDISK_REQUIRE_INTEGRATION: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Dependencies
+        run: docker compose -p netdisk-ci -f compose.test.yml up -d --build --wait
+      - name: Migrations
+        run: go run ./cmd/migrate
+      - name: Format and vet
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+      - name: Real PG, S3 and NFS with race detector
+        run: go test -race ./... -count=1 -timeout=10m
+      - name: Build
+        run: go build ./cmd/...
+      - name: Cleanup
+        if: always()
+        run: docker compose -p netdisk-ci -f compose.test.yml down

@@ -14,6 +14,7 @@ import (
 
 	"github.com/Miraitowa-kawayi/netdisk/internal/config"
 	"github.com/Miraitowa-kawayi/netdisk/internal/handler"
+	"github.com/Miraitowa-kawayi/netdisk/internal/nfsgateway"
 	"github.com/Miraitowa-kawayi/netdisk/internal/repository"
 	"github.com/Miraitowa-kawayi/netdisk/internal/service"
 	"github.com/Miraitowa-kawayi/netdisk/internal/storage"
@@ -52,24 +53,65 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	if err := store.Migrate(ctx); err != nil {
+		return err
+	}
+
 	// 内容存储后端：上层只依赖 storage.Storage 接口。
-	var blobStore storage.Storage
-	switch cfg.StorageDriver {
-	case "local":
-		local, err := storage.NewLocal(cfg.StorageDir)
+	local, err := storage.NewLocal(cfg.StorageDir)
+	if err != nil {
+		return err
+	}
+	backends := map[string]storage.Storage{"local": local}
+	if cfg.S3.Endpoint != "" {
+		s3, err := storage.NewS3(cfg.S3)
 		if err != nil {
 			return err
 		}
-		blobStore = local
-	default:
-		return fmt.Errorf("unsupported NETDISK_STORAGE_DRIVER %q", cfg.StorageDriver)
+		checkCtx, checkCancel := context.WithTimeout(ctx, 15*time.Second)
+		err = s3.EnsureBucket(checkCtx)
+		checkCancel()
+		if err != nil {
+			return fmt.Errorf("S3 bucket: %w", err)
+		}
+		backends["s3"] = s3
 	}
+	selected, ok := backends[cfg.StorageDriver]
+	if !ok {
+		return fmt.Errorf("storage backend %q is not configured", cfg.StorageDriver)
+	}
+	blobStore := &storage.Backends{Storage: selected, Default: cfg.StorageDriver, Stores: backends}
 
 	tokens := service.NewTokens(cfg.JWTSecret, cfg.JWTTTL)
-	auth := service.NewAuth(store, tokens)
+	auth := service.NewAuthWithOptions(store, tokens, cfg.RefreshTTL, cfg.DefaultQuotaBytes)
 	files := service.NewFiles(store, blobStore, cfg.StorageDriver, logger)
 	uploads := service.NewUploads(store, blobStore, cfg.StorageDriver, logger)
+	go uploads.RunCleanup(ctx, service.MaintenanceOptions{
+		Files:             files,
+		TrashRetention:    cfg.TrashRetention,
+		AutoTierThreshold: cfg.AutoTierThreshold,
+		AutoTierMinSize:   cfg.AutoTierMinSize,
+	})
 	shares := service.NewShares(store, files, logger)
+	if cfg.NFSAddr != "" {
+		user, err := store.GetUserByUsername(ctx, cfg.NFSUser)
+		if err != nil {
+			return fmt.Errorf("NFS export user: %w", err)
+		}
+		listener, err := nfsgateway.Listen(cfg.NFSAddr, cfg.NFSClients)
+		if err != nil {
+			return err
+		}
+		defer listener.Close()
+		fs := nfsgateway.NewFS(ctx, files, user.ID, "")
+		go func() {
+			if err := nfsgateway.Serve(ctx, listener, fs); err != nil && ctx.Err() == nil {
+				logger.Error("NFS stopped", "error", err)
+				stop()
+			}
+		}()
+		logger.Info("NFS export listening", "addr", cfg.NFSAddr, "user", cfg.NFSUser)
+	}
 
 	srv := &http.Server{
 		Addr: cfg.Addr,

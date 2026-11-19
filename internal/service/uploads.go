@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"github.com/Miraitowa-kawayi/netdisk/internal/model"
 	"github.com/Miraitowa-kawayi/netdisk/internal/repository"
@@ -81,13 +82,32 @@ func (u *Uploads) Create(ctx context.Context, in CreateInput) (model.UploadSessi
 	if err := checkParentDir(ctx, u.store, in.OwnerID, in.ParentID); err != nil {
 		return model.UploadSession{}, err
 	}
+	if err := checkQuota(ctx, u.store, in.OwnerID, in.TotalSize); err != nil {
+		return model.UploadSession{}, err
+	}
 
-	partCount := int((in.TotalSize + in.ChunkSize - 1) / in.ChunkSize)
+	if in.TotalSize > 1<<40 || in.ChunkSize > 64<<20 {
+		return model.UploadSession{}, invalid("文件最多 1 TiB，分片最多 64 MiB")
+	}
+	if in.ContentHash != nil {
+		hash, err := cleanHash(*in.ContentHash)
+		if err != nil {
+			return model.UploadSession{}, err
+		}
+		in.ContentHash = &hash
+	}
+	partCount := int(in.TotalSize / in.ChunkSize)
+	if in.TotalSize%in.ChunkSize != 0 {
+		partCount++
+	}
+	if partCount > 100000 {
+		return model.UploadSession{}, invalid("分片数最多 100000")
+	}
 	if partCount < 1 {
 		partCount = 1 // 空文件也是"1 片、0 字节"
 	}
 	return u.store.CreateUploadSession(ctx, in.OwnerID, in.ParentID, name,
-		in.TotalSize, in.ChunkSize, partCount, in.ContentHash)
+		in.TotalSize, in.ChunkSize, partCount, in.ContentHash, u.backend)
 }
 
 // UploadStatus 是一次查询会话的结果：收到的分片号 + 还缺的分片号。
@@ -139,53 +159,82 @@ func expectedPartSize(sess model.UploadSession, partNo int) int64 {
 // PutPart 收一个分片：流式写入存储并登记行（重复上传同一片为幂等覆盖）。
 // 分片大小必须严格等于应有字节数，不符则删掉刚写入的对象并返回错误。
 func (u *Uploads) PutPart(ctx context.Context, ownerID, sessionID uuid.UUID, partNo int, body io.Reader) (model.UploadPart, error) {
+	unlock, err := u.store.LockUpload(ctx, sessionID)
+	if err != nil {
+		return model.UploadPart{}, err
+	}
+	defer unlock()
+
 	sess, err := u.store.GetUploadSession(ctx, ownerID, sessionID)
 	if err != nil {
 		return model.UploadPart{}, mapNotFound(err)
 	}
-	if sess.Status != "pending" {
+	if sess.Status != "pending" || !sess.ExpiresAt.After(time.Now()) {
 		return model.UploadPart{}, ErrUploadNotPending
 	}
 	if partNo < 0 || partNo >= sess.PartCount {
 		return model.UploadPart{}, invalid("part_no 超出范围：本会话共 %d 片（0..%d）", sess.PartCount, sess.PartCount-1)
 	}
 
+	st, err := storage.For(u.storage, sess.Backend)
+	if err != nil {
+		return model.UploadPart{}, err
+	}
+	oldParts, err := u.store.ListUploadParts(ctx, sessionID)
+	if err != nil {
+		return model.UploadPart{}, err
+	}
 	want := expectedPartSize(sess, partNo)
-	key := partKey(sessionID, partNo)
+	key := partKey(sessionID, partNo) + "-" + uuid.NewString()
 	// 多读 1 字节用于判断超长，实际大小由随后的 Stat 校验。
-	checksum, err := u.storage.Put(ctx, key, io.LimitReader(body, want+1), want)
+	checksum, err := st.Put(ctx, key, io.LimitReader(body, want+1), want)
 	if err != nil {
 		return model.UploadPart{}, fmt.Errorf("write part: %w", err)
 	}
-	info, err := u.storage.Stat(ctx, key)
+	info, err := st.Stat(ctx, key)
 	if err != nil {
 		return model.UploadPart{}, err
 	}
 	if info.Size != want {
-		_ = u.storage.Delete(ctx, key)
+		_ = st.Delete(ctx, key)
 		return model.UploadPart{}, invalid("第 %d 片大小应为 %d 字节，实收 %d", partNo, want, info.Size)
 	}
 
-	if err := u.store.PutUploadPart(ctx, sessionID, partNo, info.Size, checksum); err != nil {
-		_ = u.storage.Delete(ctx, key)
+	if err := u.store.PutUploadPart(ctx, sessionID, partNo, info.Size, checksum, key); err != nil {
+		_ = st.Delete(ctx, key)
 		return model.UploadPart{}, err
 	}
-	return model.UploadPart{SessionID: sessionID, PartNo: partNo, Size: info.Size, Checksum: checksum}, nil
+	for _, old := range oldParts {
+		if old.PartNo == partNo {
+			_ = st.Delete(ctx, old.StorageKey)
+		}
+	}
+	return model.UploadPart{StorageKey: key, SessionID: sessionID, PartNo: partNo, Size: info.Size, Checksum: checksum}, nil
 }
 
 // Abort 放弃一个会话：标记 aborted 并删掉已收到的分片对象；
 // 已不在 pending 的会话重复放弃也返回 nil。
 func (u *Uploads) Abort(ctx context.Context, ownerID, sessionID uuid.UUID) error {
+	unlock, err := u.store.LockUpload(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	sess, err := u.store.GetUploadSession(ctx, ownerID, sessionID)
 	if err != nil {
 		return mapNotFound(err)
+	}
+	st, err := storage.For(u.storage, sess.Backend)
+	if err != nil {
+		return err
 	}
 	parts, err := u.store.ListUploadParts(ctx, sessionID)
 	if err != nil {
 		return err
 	}
 	for _, p := range parts {
-		if err := u.storage.Delete(ctx, partKey(sessionID, p.PartNo)); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		if err := st.Delete(ctx, p.StorageKey); err != nil && !errors.Is(err, storage.ErrNotFound) {
 			u.logger.Warn("delete aborted part", "session_id", sessionID, "part_no", p.PartNo, "error", err)
 		}
 	}
@@ -201,12 +250,28 @@ func (u *Uploads) Abort(ctx context.Context, ownerID, sessionID uuid.UUID) error
 // 并把会话标记为 completed、删掉临时分片对象。
 // 缺分片时返回 ErrUploadIncomplete 且不改动任何状态。
 func (u *Uploads) Complete(ctx context.Context, ownerID, sessionID uuid.UUID) (model.Node, error) {
+	unlock, err := u.store.LockUpload(ctx, sessionID)
+	if err != nil {
+		return model.Node{}, err
+	}
+	defer unlock()
+
 	session, err := u.store.GetUploadSession(ctx, ownerID, sessionID)
 	if err != nil {
 		return model.Node{}, mapNotFound(err)
 	}
-	if session.Status != "pending" {
+	if session.Status != "pending" || !session.ExpiresAt.After(time.Now()) {
 		return model.Node{}, ErrUploadNotPending
+	}
+	st, err := storage.For(u.storage, session.Backend)
+	if err != nil {
+		return model.Node{}, err
+	}
+	if err := checkParentDir(ctx, u.store, ownerID, session.ParentID); err != nil {
+		return model.Node{}, err
+	}
+	if err := checkQuota(ctx, u.store, ownerID, session.TotalSize); err != nil {
+		return model.Node{}, err
 	}
 	parts, err := u.store.ListUploadParts(ctx, sessionID)
 	if err != nil {
@@ -217,41 +282,37 @@ func (u *Uploads) Complete(ctx context.Context, ownerID, sessionID uuid.UUID) (m
 	}
 	srcKeys := make([]string, 0, len(parts))
 	for _, part := range parts {
-		srcKeys = append(srcKeys, partKey(sessionID, part.PartNo))
+		srcKeys = append(srcKeys, part.StorageKey)
 	}
 	destKey := "blobs/" + uuid.NewString()
 
-	hash, size, err := u.storage.Concat(ctx, destKey, srcKeys)
+	hash, size, err := st.Concat(ctx, destKey, srcKeys)
 	if err != nil {
 		return model.Node{}, fmt.Errorf("concat parts: %w", err)
 	}
-	blob, recorded, err := u.store.UpsertBlob(ctx, hash, size, u.backend, destKey)
+	if size != session.TotalSize || (session.ContentHash != nil && hash != *session.ContentHash) {
+		_ = st.Delete(ctx, destKey)
+		return model.Node{}, invalid("完整文件大小或 SHA-256 校验失败")
+	}
+	blob, recorded, err := u.store.UpsertBlob(ctx, hash, size, session.Backend, destKey)
 	if err != nil {
-		_ = u.storage.Delete(ctx, destKey) // 登记失败则删掉刚拼好的对象
+		_ = st.Delete(ctx, destKey) // 登记失败则删掉刚拼好的对象
 		return model.Node{}, fmt.Errorf("upsert blob: %w", err)
 	}
 
 	if !recorded {
-		if err := u.storage.Delete(ctx, destKey); err != nil &&
+		if err := st.Delete(ctx, destKey); err != nil &&
 			!errors.Is(err, storage.ErrNotFound) {
 			return model.Node{}, fmt.Errorf("delete duplicate blob: %w", err)
 		}
 	}
-	node, err := u.store.CreateNode(
-		ctx,
-		ownerID,
-		session.ParentID,
-		session.Name,
-		false,
-		size,
-		&blob.ID,
-	)
+	node, err := u.store.CompleteUploadNode(ctx, ownerID, sessionID, blob.ID, size)
 	if err != nil {
 		if errors.Is(err, repository.ErrUniqueViolation) {
 			if recorded {
 				deleted, cleanupErr := u.store.DeleteBlobIfUnreferenced(ctx, blob.ID)
 				if cleanupErr == nil && deleted {
-					_ = u.storage.Delete(ctx, destKey)
+					_ = st.Delete(ctx, destKey)
 				}
 			}
 
@@ -260,23 +321,11 @@ func (u *Uploads) Complete(ctx context.Context, ownerID, sessionID uuid.UUID) (m
 
 		return model.Node{}, fmt.Errorf("create node: %w", err)
 	}
-	ok, err := u.store.TransitionUploadSession(
-		ctx,
-		ownerID,
-		sessionID,
-		"pending",
-		"completed",
-	)
-	if err != nil {
-		return model.Node{}, fmt.Errorf("complete upload session: %w", err)
-	}
-	if !ok {
-		return model.Node{}, ErrUploadNotPending
-	}
+
 	// 节点已建、会话已 completed，删分片失败只留下垃圾，不影响本次收尾结果。
 	for _, part := range parts {
-		key := partKey(sessionID, part.PartNo)
-		if err := u.storage.Delete(ctx, key); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		key := part.StorageKey
+		if err := st.Delete(ctx, key); err != nil && !errors.Is(err, storage.ErrNotFound) {
 			u.logger.Warn("delete completed part", "session_id", sessionID, "part_no", part.PartNo, "error", err)
 		}
 	}

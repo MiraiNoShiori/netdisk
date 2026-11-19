@@ -11,13 +11,18 @@ import (
 
 // 对外错误码。
 const (
-	CodeInvalidRequest = "invalid_request"
-	CodeUnauthorized   = "unauthorized"
-	CodeForbidden      = "forbidden"
-	CodeNotFound       = "not_found"
-	CodeConflict       = "conflict"
-	CodeNotReady       = "not_ready"
-	CodeInternal       = "internal_error"
+	CodeInvalidRequest        = "invalid_request"
+	CodeUnauthorized          = "unauthorized"
+	CodeForbidden             = "forbidden"
+	CodeNotFound              = "not_found"
+	CodeConflict              = "conflict"
+	CodeQuotaExceeded         = "quota_exceeded"
+	CodeRateLimited           = "rate_limited"
+	CodeSharePasswordRequired = "share_password_required"
+	CodeSharePasswordInvalid  = "share_password_invalid"
+	CodeShareLimitReached     = "share_limit_reached"
+	CodeNotReady              = "not_ready"
+	CodeInternal              = "internal_error"
 )
 
 // Error 是贯穿各层的应用错误；Err 只写日志，不返回给客户端。

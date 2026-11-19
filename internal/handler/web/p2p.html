@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>NetDisk · 局域网 P2P 直传</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div class="standalone-shell">
+      <div class="standalone-header">
+        <div>
+          <span class="brand-badge">NETDISK · WEBRTC P2P DIRECT</span>
+          <h1>局域网端到端文件直传</h1>
+        </div>
+        <a href="/">← 返回我的网盘</a>
+      </div>
+
+      <p class="muted" style="margin-top: 0;">
+        两端保持页面打开。服务端仅交换 WebRTC SDP 连接信令，文件字节完全在设备间点对点传输，不占用服务器带宽与存储。
+      </p>
+
+      <div id="send" class="card" style="margin-bottom: 16px;">
+        <h3 style="margin-top: 0;">发送文件</h3>
+        <p class="muted">先在网盘页面登录，再选择本机文件创建一次性邀请链接（30 分钟内有效，单接收方）。</p>
+        <div class="row" style="margin-bottom: 12px;">
+          <input id="file" type="file" style="width: auto;" />
+          <button id="start">生成邀请链接</button>
+        </div>
+        <div class="row">
+          <input id="invite" type="text" readonly placeholder="邀请链接将在这里出现" style="flex: 1;" />
+          <button type="button" id="copy-invite" class="secondary" disabled>复制链接</button>
+        </div>
+      </div>
+
+      <div id="receive" class="card" hidden style="margin-bottom: 16px;">
+        <h3 id="filename" style="margin-top: 0;">接收文件</h3>
+        <p id="details" class="muted"></p>
+        <button id="accept">选择保存位置并开始直连</button>
+        <p class="muted" style="margin-bottom: 0;">
+          支持 File System Access API 的 Chrome / Edge（HTTPS 或 localhost）会流式直写磁盘；兼容模式上限 64 MiB。
+        </p>
+      </div>
+
+      <div class="card">
+        <div class="toolbar">
+          <h3 style="margin: 0;">传输状态</h3>
+          <button id="cancel" class="secondary sm">取消传输</button>
+        </div>
+        <progress id="progress" value="0" max="1" style="width: 100%; height: 14px; accent-color: var(--primary); margin-bottom: 10px;"></progress>
+        <div id="status" class="status-banner" role="status" aria-live="polite">准备就绪</div>
+        <p id="checksum" class="muted mono" style="margin-bottom: 0;" hidden></p>
+      </div>
+    </div>
+
+    <script type="module" src="/p2p.js"></script>
+  </body>
+</html>

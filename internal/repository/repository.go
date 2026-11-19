@@ -38,7 +38,8 @@ func translate(err error) error {
 
 // Store 持有连接池，各实体的查询方法按主题拆在同包的多个文件里。
 type Store struct {
-	pool *pgxpool.Pool
+	pool  *pgxpool.Pool
+	locks *pgxpool.Pool
 }
 
 // New 建连接池。pgxpool 惰性连接，此处不校验可达性（启动检查在 Ping 或 /readyz）。
@@ -47,11 +48,19 @@ func New(ctx context.Context, dsn string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create pgx pool: %w", err)
 	}
-	return &Store{pool: pool}, nil
+	// 锁等待使用独立连接池，避免等待者占满业务池后持锁者无法执行 SQL。
+	lockCfg := pool.Config()
+	lockCfg.MaxConns = 4
+	locks, err := pgxpool.NewWithConfig(ctx, lockCfg)
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return &Store{pool: pool, locks: locks}, nil
 }
 
 // Close 关闭连接池，等待在用连接归还。
-func (s *Store) Close() { s.pool.Close() }
+func (s *Store) Close() { s.locks.Close(); s.pool.Close() }
 
 // Ping 验证数据库可达，供启动检查与 /readyz 使用。
 func (s *Store) Ping(ctx context.Context) error {

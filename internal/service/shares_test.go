@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +14,7 @@ import (
 	"github.com/Miraitowa-kawayi/netdisk/internal/model"
 	"github.com/Miraitowa-kawayi/netdisk/internal/repository"
 	"github.com/Miraitowa-kawayi/netdisk/internal/storage"
+	"github.com/Miraitowa-kawayi/netdisk/internal/testutil"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -32,25 +32,22 @@ type shareFixture struct {
 
 func newShareFixture(t *testing.T) *shareFixture {
 	t.Helper()
-	dsn := os.Getenv("NETDISK_TEST_DATABASE_URL")
-	if dsn == "" {
-		dsn = fallbackTestDSN
-	}
+	dsn := testutil.Database(t)
 	ctx := context.Background()
 
 	st, err := repository.New(ctx, dsn)
 	if err != nil {
-		t.Skipf("跳过：建连接池失败（%v）", err)
+		t.Fatalf("跳过：建连接池失败（%v）", err)
 	}
 	if err := st.Ping(ctx); err != nil {
 		st.Close()
-		t.Skipf("跳过：数据库不可达（%v）；先跑 `make up`", err)
+		t.Fatalf("跳过：数据库不可达（%v）；先跑 `make up`", err)
 	}
 	t.Cleanup(st.Close)
 
 	db, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		t.Skipf("跳过：清理用连接池建不起来（%v）", err)
+		t.Fatalf("跳过：清理用连接池建不起来（%v）", err)
 	}
 	t.Cleanup(db.Close)
 

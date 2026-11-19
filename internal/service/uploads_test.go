@@ -9,13 +9,13 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/Miraitowa-kawayi/netdisk/internal/model"
 	"github.com/Miraitowa-kawayi/netdisk/internal/repository"
 	"github.com/Miraitowa-kawayi/netdisk/internal/storage"
+	"github.com/Miraitowa-kawayi/netdisk/internal/testutil"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -31,27 +31,28 @@ type uploadFixture struct {
 	owner   uuid.UUID
 }
 
+type testLogWriter struct{ t *testing.T }
+
+func (w testLogWriter) Write(p []byte) (int, error) { w.t.Log(string(p)); return len(p), nil }
+
 func newUploadFixture(t *testing.T) *uploadFixture {
 	t.Helper()
-	dsn := os.Getenv("NETDISK_TEST_DATABASE_URL")
-	if dsn == "" {
-		dsn = fallbackTestDSN
-	}
+	dsn := testutil.Database(t)
 	ctx := context.Background()
 
 	st, err := repository.New(ctx, dsn)
 	if err != nil {
-		t.Skipf("跳过：建连接池失败（%v）", err)
+		t.Fatalf("跳过：建连接池失败（%v）", err)
 	}
 	if err := st.Ping(ctx); err != nil {
 		st.Close()
-		t.Skipf("跳过：数据库不可达（%v）；先跑 `make up`", err)
+		t.Fatalf("跳过：数据库不可达（%v）；先跑 `make up`", err)
 	}
 	t.Cleanup(st.Close)
 
 	db, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		t.Skipf("跳过：清理用连接池建不起来（%v）", err)
+		t.Fatalf("跳过：清理用连接池建不起来（%v）", err)
 	}
 	t.Cleanup(db.Close)
 
@@ -60,7 +61,7 @@ func newUploadFixture(t *testing.T) *uploadFixture {
 	if err != nil {
 		t.Fatalf("建本地存储: %v", err)
 	}
-	svc := NewUploads(st, loc, "local", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc := NewUploads(st, loc, "local", slog.New(slog.NewTextHandler(testLogWriter{t}, nil)))
 
 	f := &uploadFixture{svc: svc, store: st, cleanDB: db, ctx: ctx, dir: dir}
 	f.owner = f.newUser(t)

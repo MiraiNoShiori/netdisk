@@ -1,4 +1,4 @@
-.PHONY: run build test fmt vet up up-all down reset logs psql seed
+.PHONY: run build test fmt vet up up-all down reset logs psql migrate verify
 
 # 起服务（读 .env）
 run:
@@ -27,7 +27,7 @@ up-all:
 down:
 	docker compose down
 
-# 重建数据库：改过 migrations/*.sql 后使用（脚本只在空数据卷时执行一次）
+# 仅用于明确要丢弃开发数据时；升级请用 make migrate。
 reset:
 	docker compose down -v
 	docker compose up -d postgres
@@ -38,3 +38,9 @@ logs:
 # 直接进 psql 看数据
 psql:
 	docker exec -it netdisk-postgres psql -U netdisk -d netdisk
+
+migrate:
+	go run ./cmd/migrate
+
+verify:
+	sh scripts/verify.sh

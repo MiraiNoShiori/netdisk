@@ -72,11 +72,11 @@ func (l *Local) Put(ctx context.Context, key string, r io.Reader, size int64) (s
 		}
 	}()
 
-	// 边读 r 边写盘，同时计算 SHA-256（使用io.MultiWriter分流）
+	// 边读 r 边写盘，同时计算 SHA-256（使用 io.MultiWriter 分流）；感知 ctx 取消以尽快中断半成品。
 	hasher := sha256.New()
 	mw := io.MultiWriter(tempFile, hasher)
 
-	if _, err := io.Copy(mw, r); err != nil {
+	if _, err := io.Copy(mw, &ctxReader{ctx: ctx, r: r}); err != nil {
 		return "", fmt.Errorf("storage: copy to temp file: %w", err)
 	}
 
@@ -213,6 +213,19 @@ func (l *Local) Concat(ctx context.Context, dstKey string, srcKeys []string) (st
 	success = true
 
 	return hex.EncodeToString(hasher.Sum(nil)), total, nil
+}
+
+// ctxReader 在每次 Read 前检查 context 是否已取消，避免客户端断连后继续空写临时文件。
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c *ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }
 
 // 编译期断言 Local 实现 Storage。

@@ -24,10 +24,16 @@ func newTestStore(t *testing.T) (*Store, context.Context) {
 
 	st, err := New(ctx, dsn)
 	if err != nil {
+		if os.Getenv("NETDISK_REQUIRE_INTEGRATION") == "1" {
+			t.Fatal(err)
+		}
 		t.Skipf("跳过：建连接池失败（%v）", err)
 	}
 	if err := st.Ping(ctx); err != nil {
 		st.Close()
+		if os.Getenv("NETDISK_REQUIRE_INTEGRATION") == "1" {
+			t.Fatal(err)
+		}
 		t.Skipf("跳过：数据库不可达（%v）；先跑 `make up`", err)
 	}
 	t.Cleanup(st.Close)

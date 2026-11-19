@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/Miraitowa-kawayi/netdisk/internal/config"
+	"github.com/Miraitowa-kawayi/netdisk/internal/handler/web"
 	"github.com/Miraitowa-kawayi/netdisk/internal/httpx"
 	"github.com/Miraitowa-kawayi/netdisk/internal/middleware"
 	"github.com/Miraitowa-kawayi/netdisk/internal/repository"
@@ -23,6 +24,7 @@ type Deps struct {
 	Files   *service.Files
 	Uploads *service.Uploads
 	Shares  *service.Shares
+	Peers   *service.Peers
 }
 
 // Server 持有依赖，各 handler 是它的方法。
@@ -32,12 +34,19 @@ type Server struct {
 
 // NewRouter 组装中间件与路由。
 func NewRouter(deps Deps) http.Handler {
+	if deps.Peers == nil {
+		deps.Peers = service.NewPeers()
+	}
 	s := &Server{deps: deps}
 
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID)
 	r.Use(middleware.RequestLogger(deps.Logger))
 	r.Use(middleware.Recoverer(deps.Logger))
+	if deps.Cfg != nil && len(deps.Cfg.CORSOrigins) > 0 {
+		r.Use(middleware.CORS(deps.Cfg.CORSOrigins))
+	}
+	r.Use(middleware.AuthLimit(deps.Logger))
 	// 不挂 chi 的 Timeout / RequestSize 中间件：上传是大体积长连接，统一限时会掐断大文件。
 	// 超时策略放在单条路由上按需设置。
 
@@ -54,28 +63,65 @@ func NewRouter(deps Deps) http.Handler {
 	r.Get("/readyz", s.readyz)
 
 	// /api/v1：auth 公开，其余需 Bearer token。
-	requireAuth := middleware.RequireAuth(deps.Logger, deps.Auth.Tokens())
+	requireAuth := middleware.RequireAuth(deps.Logger, deps.Auth)
 
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Route("/auth", func(r chi.Router) {
 			r.Post("/register", s.authRegister)
 			r.Post("/login", s.authLogin)
+			r.Post("/refresh", s.authRefresh)
 			r.Group(func(r chi.Router) {
 				r.Use(requireAuth)
 				r.Get("/me", s.authMe)
+				r.Get("/stats", s.authStats)
+				r.Post("/logout", s.logout)
+				r.Patch("/me", s.profile)
+				r.Post("/password", s.password)
+				r.Delete("/me", s.deleteAccount)
 			})
 		})
 
+		r.Route("/p2p/shares", func(r chi.Router) {
+			r.Use(requireAuth)
+			r.Post("/", s.createPeer)
+			r.Get("/", s.listPeers)
+			r.Get("/{id}", s.getPeer)
+			r.Delete("/{id}", s.deletePeer)
+			r.Post("/{id}/offer", s.offerPeer)
+		})
+		r.Get("/p2p/{token}", s.resolvePeer)
+		r.Post("/p2p/{token}/answer", s.answerPeer)
+
 		r.Route("/files", func(r chi.Router) {
 			r.Use(requireAuth)
-			r.Post("/", s.uploadFile)               // multipart 上传，流式
-			r.Post("/dirs", s.createDir)            // 新建文件夹（JSON）
-			r.Post("/instant", s.instantUpload)     // 秒传：报 hash，命中则不收字节（JSON）
-			r.Get("/", s.listFiles)                 // ?parent_id=<uuid>|root
-			r.Get("/{id}/download", s.downloadFile) // ServeContent 提供 Range/206
-			r.Get("/{id}/zip", s.downloadZip)       // 整棵子树打包成 zip（流式，无 Range）
-			r.Patch("/{id}", s.patchFile)           // 改名和/或移动
-			r.Delete("/{id}", s.deleteFile)         // 软删；文件夹连同子树
+			r.Post("/", s.uploadFile)           // multipart 上传，流式
+			r.Post("/dirs", s.createDir)        // 新建文件夹（JSON）
+			r.Post("/instant", s.instantUpload) // 秒传：报 hash，命中则不收字节（JSON）
+			r.Get("/folders", s.listFolders)    // 所有目录列表，供目录树选择器
+			r.Get("/", s.listFiles)             // 支持 parent_id / q / type / sort / order / limit / offset
+			r.Get("/{id}/ancestors", s.fileAncestors)
+			r.Get("/{id}/download", s.downloadFile) // ServeContent 提供 Range/206，支持 ?inline=1 安全预览
+			r.Post("/{id}/migrate", s.migrateFile)
+			r.Get("/{id}/direct-url", s.directURL)
+			r.Get("/{id}/zip", s.downloadZip) // 整棵子树打包成 zip（单查询流式，无 Range）
+			r.Patch("/{id}", s.patchFile)     // 改名和/或移动
+			r.Delete("/{id}", s.deleteFile)   // 移入回收站；?permanent=true 立即彻底删除
+		})
+
+		// 回收站：列出、恢复子树、彻底删除单项、一键清空。
+		r.Route("/trash", func(r chi.Router) {
+			r.Use(requireAuth)
+			r.Get("/", s.listTrash)
+			r.Post("/{id}/restore", s.restoreTrash)
+			r.Delete("/{id}", s.purgeTrashItem)
+			r.Delete("/", s.emptyTrash)
+		})
+
+		// 存储策略与热点分层。
+		r.Route("/storage", func(r chi.Router) {
+			r.Use(requireAuth)
+			r.Get("/policy", s.storagePolicy)
+			r.Post("/tier/run", s.runAutoTier)
 		})
 
 		// 断点续传：分片上传会话。
@@ -92,13 +138,17 @@ func NewRouter(deps Deps) http.Handler {
 		// 分享：管理需登录；匿名访问走 /share/{token}，不挂 requireAuth，校验在 service。
 		r.Route("/shares", func(r chi.Router) {
 			r.Use(requireAuth)
-			r.Post("/", s.createShare)       // 建：{node_id, expires_in_seconds?}
-			r.Get("/", s.listShares)         // 列自己建的分享
+			r.Post("/", s.createShare) // 建：{node_id, expires_in_seconds?, password?, max_downloads?}
+			r.Get("/", s.listShares)   // 列自己建的分享
+			r.Get("/{id}/analytics", s.shareAnalytics)
 			r.Delete("/{id}", s.deleteShare) // 撤销
 		})
+		r.Post("/share/{token}/verify", s.verifyShare)       // 验证提取码并签发免密 Cookie
 		r.Get("/share/{token}", s.resolveShare)              // 匿名打开（文件/文件夹元信息）
-		r.Get("/share/{token}/download", s.downloadViaShare) // 匿名下载（?node_id= 指定子项）
+		r.Get("/share/{token}/download", s.downloadViaShare) // 匿名下载（?node_id= 指定子项，?inline=1 预览）
 	})
 
+	r.Get("/favicon.ico", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) })
+	r.Handle("/*", http.FileServer(http.FS(web.Files)))
 	return r
 }
