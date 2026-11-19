@@ -78,6 +78,19 @@ func TestS3UploadResumeAfterDefaultSwitch(t *testing.T) {
 	if err = files.Delete(f.ctx, f.owner, duplicate.ID); err != nil {
 		t.Fatal(err)
 	}
+	// 两份引用都还在回收站里，底层内容要保留，否则恢复出来就是空文件。
+	if _, err = s3.Stat(f.ctx, blob.StorageKey); err != nil {
+		t.Fatal("trashed reference must keep content")
+	}
+	if err = files.PurgeTrashItem(f.ctx, f.owner, node.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s3.Stat(f.ctx, blob.StorageKey); err != nil {
+		t.Fatal("shared blob reclaimed prematurely")
+	}
+	if err = files.PurgeTrashItem(f.ctx, f.owner, duplicate.ID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = s3.Stat(f.ctx, blob.StorageKey); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatal("last S3 reference not reclaimed")
 	}
