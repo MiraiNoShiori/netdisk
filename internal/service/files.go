@@ -97,30 +97,18 @@ func (f *Files) Upload(ctx context.Context, in UploadInput) (model.Node, error) 
 		return model.Node{}, err
 	}
 
-	blob, recorded, err := f.store.UpsertBlob(ctx, hash, counted.n, f.backend, key)
+	node, _, recorded, err := f.store.UpsertBlobAndCreateNode(ctx, in.OwnerID, in.ParentID, name, hash, counted.n, f.backend, key)
 	if err != nil {
-		_ = f.dropUploadObject(ctx, key) // 登记失败则删掉刚写的对象
-		return model.Node{}, err
-	}
-	if !recorded {
-		// 内容已存在：删掉刚写的副本，复用库里的对象。
-		if err := f.dropUploadObject(ctx, key); err != nil {
-			return model.Node{}, fmt.Errorf("drop duplicate object: %w", err)
-		}
-	}
-
-	node, err := f.store.CreateNode(ctx, in.OwnerID, in.ParentID, name, false, blob.Size, &blob.ID)
-	if err != nil {
-		// 并发重名被唯一索引挡下：收回本次登记。
-		if recorded {
-			f.cleanupBlob(ctx, blob.ID, blob.StorageKey)
-		}
+		_ = f.dropUploadObject(ctx, key) // 事务回滚，回收刚写入的独占对象
 		if errors.Is(err, repository.ErrUniqueViolation) {
 			return model.Node{}, ErrNameConflict
 		}
 		return model.Node{}, err
 	}
-	node.Backend = blob.Backend
+	if !recorded {
+		// 内容已存在：节点已指向旧 blob，异步或立即清掉刚写的临时副本即可。
+		_ = f.dropUploadObject(ctx, key)
+	}
 	return node, nil
 }
 
@@ -174,33 +162,23 @@ func (f *Files) InstantUpload(ctx context.Context, in InstantInput) (model.Node,
 		return model.Node{}, err
 	}
 
-	var blob model.Blob
-	if f.AllowGlobalInstantUpload {
-		blob, err = f.store.GetBlobByHash(ctx, hash)
-	} else {
-		blob, err = f.store.GetOwnedBlobByHash(ctx, in.OwnerID, hash)
-	}
-	if errors.Is(err, repository.ErrNotFound) {
+	if in.Size < 0 {
 		return model.Node{}, ErrContentNotStored
 	}
-	if err != nil {
-		return model.Node{}, err
-	}
-	if in.Size != blob.Size {
-		return model.Node{}, ErrContentNotStored
-	}
-	if err := checkQuota(ctx, f.store, in.OwnerID, blob.Size); err != nil {
+	if err := checkQuota(ctx, f.store, in.OwnerID, in.Size); err != nil {
 		return model.Node{}, err
 	}
 
-	node, err := f.store.CreateNode(ctx, in.OwnerID, in.ParentID, name, false, blob.Size, &blob.ID)
+	node, err := f.store.InstantCreateNode(ctx, in.OwnerID, in.ParentID, name, hash, in.Size, f.AllowGlobalInstantUpload)
+	if errors.Is(err, repository.ErrNotFound) {
+		return model.Node{}, ErrContentNotStored
+	}
 	if errors.Is(err, repository.ErrUniqueViolation) {
 		return model.Node{}, ErrNameConflict
 	}
 	if err != nil {
 		return model.Node{}, err
 	}
-	node.Backend = blob.Backend
 	return node, nil
 }
 

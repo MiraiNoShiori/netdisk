@@ -49,6 +49,83 @@ func (s *Store) UpsertBlob(ctx context.Context, hash string, size int64, backend
 	return blob, recorded, translate(err)
 }
 
+// UpsertBlobAndCreateNode 在同一事务中登记内容块并创建节点，消除登记与建节点之间的并发 GC 竞态窗口。
+// 若节点创建失败（如重名冲突），事务回滚不会残留无引用 blob 行。
+func (s *Store) UpsertBlobAndCreateNode(ctx context.Context, ownerID uuid.UUID, parentID *uuid.UUID, name, hash string, size int64, backend, storageKey string) (node model.Node, blob model.Blob, recorded bool, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return model.Node{}, model.Blob{}, false, err
+	}
+	defer tx.Rollback(ctx)
+
+	const upsertQ = `INSERT INTO blobs(content_hash,size,backend,storage_key) VALUES($1,$2,$3,$4)
+ ON CONFLICT(content_hash) DO UPDATE SET content_hash=EXCLUDED.content_hash
+ RETURNING ` + blobColumns + `, (xmax=0) AS recorded`
+
+	if err = tx.QueryRow(ctx, upsertQ, hash, size, backend, storageKey).Scan(
+		&blob.ID, &blob.ContentHash, &blob.Size, &blob.Backend, &blob.StorageKey,
+		&blob.DownloadCount, &blob.LastAccessedAt, &blob.CreatedAt, &recorded,
+	); err != nil {
+		return model.Node{}, model.Blob{}, false, translate(err)
+	}
+
+	node, err = scanNode(tx.QueryRow(ctx, `
+INSERT INTO nodes (owner_id, parent_id, name, is_dir, size, blob_id)
+VALUES ($1, $2, $3, false, $4, $5)
+RETURNING `+nodeColumns,
+		ownerID, parentID, name, blob.Size, blob.ID))
+	if err != nil {
+		return model.Node{}, model.Blob{}, recorded, err
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return model.Node{}, model.Blob{}, false, err
+	}
+	node.Backend = blob.Backend
+	return node, blob, recorded, nil
+}
+
+// InstantCreateNode 在同一事务中以 FOR SHARE 锁住目标 blob 并插入节点，防止秒传窗口内被并发 GC 回收。
+// 若未命中、无权复用或 size 不一致统一返回 ErrNotFound。
+func (s *Store) InstantCreateNode(ctx context.Context, ownerID uuid.UUID, parentID *uuid.UUID, name, hash string, size int64, allowGlobal bool) (model.Node, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return model.Node{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	var blob model.Blob
+	if allowGlobal {
+		blob, err = scanBlob(tx.QueryRow(ctx,
+			`SELECT `+blobColumns+` FROM blobs WHERE content_hash = $1 FOR SHARE`, hash))
+	} else {
+		blob, err = scanBlob(tx.QueryRow(ctx, `SELECT `+blobColumns+` FROM blobs
+ WHERE content_hash = $1 AND EXISTS (
+   SELECT 1 FROM nodes WHERE blob_id = blobs.id AND owner_id = $2 AND deleted_at IS NULL
+ ) FOR SHARE`, hash, ownerID))
+	}
+	if err != nil {
+		return model.Node{}, err
+	}
+	if size != blob.Size {
+		return model.Node{}, ErrNotFound
+	}
+
+	node, err := scanNode(tx.QueryRow(ctx, `
+INSERT INTO nodes (owner_id, parent_id, name, is_dir, size, blob_id)
+VALUES ($1, $2, $3, false, $4, $5)
+RETURNING `+nodeColumns,
+		ownerID, parentID, name, blob.Size, blob.ID))
+	if err != nil {
+		return model.Node{}, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return model.Node{}, err
+	}
+	node.Backend = blob.Backend
+	return node, nil
+}
+
 // RecordBlobDownload 累加内容块访问热度与最近访问时间，供热点文件智能分层策略使用。
 func (s *Store) RecordBlobDownload(ctx context.Context, id uuid.UUID) error {
 	_, err := s.pool.Exec(ctx, `

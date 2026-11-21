@@ -5,12 +5,13 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	"github.com/MiraiNoShiori/netdisk/internal/storage"
 	"net/netip"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/MiraiNoShiori/netdisk/internal/storage"
 )
 
 // Config 是服务启动所需的全部配置。
@@ -91,28 +92,28 @@ func Load() (*Config, error) {
 		StorageDir:        envOr("NETDISK_STORAGE_DIR", "./data/blobs"),
 	}
 
-	cfg.AllowRegister, err = strconv.ParseBool(envOr("ALLOW_REGISTER", "true"))
+	cfg.AllowRegister, err = strconv.ParseBool(envFirst("true", "NETDISK_ALLOW_REGISTER", "ALLOW_REGISTER"))
 	if err != nil {
-		return nil, fmt.Errorf("ALLOW_REGISTER: %w", err)
+		return nil, fmt.Errorf("NETDISK_ALLOW_REGISTER: %w", err)
 	}
-	cfg.CookieSecure = strings.ToLower(strings.TrimSpace(envOr("COOKIE_SECURE", "auto")))
+	cfg.CookieSecure = strings.ToLower(strings.TrimSpace(envFirst("auto", "NETDISK_COOKIE_SECURE", "COOKIE_SECURE")))
 	switch cfg.CookieSecure {
 	case "auto", "true", "false":
 	default:
-		return nil, fmt.Errorf("COOKIE_SECURE must be auto, true or false")
+		return nil, fmt.Errorf("NETDISK_COOKIE_SECURE must be auto, true or false")
 	}
-	if raw := envOr("TRUSTED_PROXY_CIDRS", ""); raw != "" {
+	if raw := envFirst("", "NETDISK_TRUSTED_PROXY_CIDRS", "TRUSTED_PROXY_CIDRS"); raw != "" {
 		for _, cidr := range strings.Split(raw, ",") {
 			prefix, err := netip.ParsePrefix(strings.TrimSpace(cidr))
 			if err != nil {
-				return nil, fmt.Errorf("TRUSTED_PROXY_CIDRS: %w", err)
+				return nil, fmt.Errorf("NETDISK_TRUSTED_PROXY_CIDRS: %w", err)
 			}
 			cfg.TrustedProxyCIDRs = append(cfg.TrustedProxyCIDRs, prefix)
 		}
 	}
-	cfg.AllowGlobalInstantUpload, err = strconv.ParseBool(envOr("ALLOW_GLOBAL_INSTANT_UPLOAD", "false"))
+	cfg.AllowGlobalInstantUpload, err = strconv.ParseBool(envFirst("false", "NETDISK_ALLOW_GLOBAL_INSTANT_UPLOAD", "ALLOW_GLOBAL_INSTANT_UPLOAD"))
 	if err != nil {
-		return nil, fmt.Errorf("ALLOW_GLOBAL_INSTANT_UPLOAD: %w", err)
+		return nil, fmt.Errorf("NETDISK_ALLOW_GLOBAL_INSTANT_UPLOAD: %w", err)
 	}
 
 	secure, err := strconv.ParseBool(envOr("NETDISK_S3_USE_SSL", "false"))
@@ -149,6 +150,16 @@ func Load() (*Config, error) {
 func envOr(key, fallback string) string {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		return v
+	}
+	return fallback
+}
+
+// envFirst 按优先级依次读取多个环境变量名，用于向后兼容无 NETDISK_ 前缀的旧名称。
+func envFirst(fallback string, keys ...string) string {
+	for _, key := range keys {
+		if v, ok := os.LookupEnv(key); ok && v != "" {
+			return v
+		}
 	}
 	return fallback
 }

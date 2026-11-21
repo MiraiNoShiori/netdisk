@@ -294,32 +294,25 @@ func (u *Uploads) Complete(ctx context.Context, ownerID, sessionID uuid.UUID) (m
 		_ = st.Delete(ctx, destKey)
 		return model.Node{}, invalid("完整文件大小或 SHA-256 校验失败")
 	}
-	blob, recorded, err := u.store.UpsertBlob(ctx, hash, size, session.Backend, destKey)
+	node, _, recorded, err := u.store.CompleteUploadWithBlob(ctx, ownerID, sessionID, hash, size, session.Backend, destKey)
 	if err != nil {
-		_ = st.Delete(ctx, destKey) // 登记失败则删掉刚拼好的对象
-		return model.Node{}, fmt.Errorf("upsert blob: %w", err)
-	}
-
-	if !recorded {
-		if err := st.Delete(ctx, destKey); err != nil &&
-			!errors.Is(err, storage.ErrNotFound) {
-			return model.Node{}, fmt.Errorf("delete duplicate blob: %w", err)
+		if delErr := st.Delete(ctx, destKey); delErr != nil && !errors.Is(delErr, storage.ErrNotFound) {
+			_ = u.store.QueueObject(ctx, session.Backend, destKey)
+			u.logger.Warn("delete rolled-back upload blob", "session_id", sessionID, "key", destKey, "error", delErr)
 		}
-	}
-	node, err := u.store.CompleteUploadNode(ctx, ownerID, sessionID, blob.ID, size)
-	if err != nil {
 		if errors.Is(err, repository.ErrUniqueViolation) {
-			if recorded {
-				deleted, cleanupErr := u.store.DeleteBlobIfUnreferenced(ctx, blob.ID)
-				if cleanupErr == nil && deleted {
-					_ = st.Delete(ctx, destKey)
-				}
-			}
-
 			return model.Node{}, ErrNameConflict
 		}
-
+		if errors.Is(err, repository.ErrNotFound) {
+			return model.Node{}, ErrUploadNotPending
+		}
 		return model.Node{}, fmt.Errorf("create node: %w", err)
+	}
+	if !recorded {
+		if err := st.Delete(ctx, destKey); err != nil && !errors.Is(err, storage.ErrNotFound) {
+			_ = u.store.QueueObject(ctx, session.Backend, destKey)
+			u.logger.Warn("delete duplicate upload blob", "session_id", sessionID, "key", destKey, "error", err)
+		}
 	}
 
 	// 节点已建、会话已 completed，删分片失败只留下垃圾，不影响本次收尾结果。
