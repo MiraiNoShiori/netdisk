@@ -85,6 +85,7 @@ func run(logger *slog.Logger) error {
 	tokens := service.NewTokens(cfg.JWTSecret, cfg.JWTTTL)
 	auth := service.NewAuthWithOptions(store, tokens, cfg.RefreshTTL, cfg.DefaultQuotaBytes)
 	files := service.NewFiles(store, blobStore, cfg.StorageDriver, logger)
+	files.AllowGlobalInstantUpload = cfg.AllowGlobalInstantUpload
 	uploads := service.NewUploads(store, blobStore, cfg.StorageDriver, logger)
 	go uploads.RunCleanup(ctx, service.MaintenanceOptions{
 		Files:             files,

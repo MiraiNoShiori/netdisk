@@ -14,6 +14,7 @@ import (
 
 // Config 是服务启动所需的全部配置。
 type Config struct {
+	AllowGlobalInstantUpload     bool
 	Addr                         string
 	DatabaseURL                  string
 	JWTSecret                    string
@@ -84,6 +85,11 @@ func Load() (*Config, error) {
 		AutoTierMinSize:   autoTierMinSize,
 		StorageDriver:     envOr("NETDISK_STORAGE_DRIVER", "local"),
 		StorageDir:        envOr("NETDISK_STORAGE_DIR", "./data/blobs"),
+	}
+
+	cfg.AllowGlobalInstantUpload, err = strconv.ParseBool(envOr("ALLOW_GLOBAL_INSTANT_UPLOAD", "false"))
+	if err != nil {
+		return nil, fmt.Errorf("ALLOW_GLOBAL_INSTANT_UPLOAD: %w", err)
 	}
 
 	secure, err := strconv.ParseBool(envOr("NETDISK_S3_USE_SSL", "false"))

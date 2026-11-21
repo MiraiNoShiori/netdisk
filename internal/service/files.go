@@ -23,10 +23,11 @@ const maxNameLen = 255
 
 // Files 实现文件的上传、下载、改名、删除、回收站、检索与打包下载。
 type Files struct {
-	store   *repository.Store
-	storage storage.Storage
-	backend string // 写进 blobs.backend，local | s3
-	logger  *slog.Logger
+	AllowGlobalInstantUpload bool // 部署时显式开启才允许跨账号按哈希复用
+	store                    *repository.Store
+	storage                  storage.Storage
+	backend                  string // 写进 blobs.backend，local | s3
+	logger                   *slog.Logger
 }
 
 func NewFiles(store *repository.Store, st storage.Storage, backend string, logger *slog.Logger) *Files {
@@ -45,7 +46,7 @@ func checkQuota(ctx context.Context, store *repository.Store, ownerID uuid.UUID,
 		}
 		return err
 	}
-	if quota > 0 && used+delta > quota {
+	if quota > 0 && delta > quota-used {
 		return ErrQuotaExceeded
 	}
 	return nil
@@ -69,10 +70,16 @@ func (f *Files) Upload(ctx context.Context, in UploadInput) (model.Node, error) 
 	if err := f.checkParent(ctx, in.OwnerID, in.ParentID); err != nil {
 		return model.Node{}, err
 	}
-	if in.SizeHint > 0 {
-		if err := checkQuota(ctx, f.store, in.OwnerID, in.SizeHint); err != nil {
-			return model.Node{}, err
+	used, quota, err := f.store.GetUserUsageAndQuota(ctx, in.OwnerID)
+	if err != nil {
+		return model.Node{}, mapNotFound(err)
+	}
+	if quota > 0 {
+		remaining := quota - used
+		if remaining <= 0 || in.SizeHint > remaining {
+			return model.Node{}, ErrQuotaExceeded
 		}
+		in.Body = &quotaReader{r: in.Body, remaining: remaining}
 	}
 
 	// 先写自己专属的 key，避免并发上传互相覆盖。
@@ -86,18 +93,18 @@ func (f *Files) Upload(ctx context.Context, in UploadInput) (model.Node, error) 
 
 	// 未知长度的流式上传读完后再用真实字节数做配额兜底校验。
 	if err := checkQuota(ctx, f.store, in.OwnerID, counted.n); err != nil {
-		_ = f.storage.Delete(ctx, key)
+		_ = f.dropUploadObject(ctx, key)
 		return model.Node{}, err
 	}
 
 	blob, recorded, err := f.store.UpsertBlob(ctx, hash, counted.n, f.backend, key)
 	if err != nil {
-		_ = f.storage.Delete(ctx, key) // 登记失败则删掉刚写的对象
+		_ = f.dropUploadObject(ctx, key) // 登记失败则删掉刚写的对象
 		return model.Node{}, err
 	}
 	if !recorded {
 		// 内容已存在：删掉刚写的副本，复用库里的对象。
-		if err := f.storage.Delete(ctx, key); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		if err := f.dropUploadObject(ctx, key); err != nil {
 			return model.Node{}, fmt.Errorf("drop duplicate object: %w", err)
 		}
 	}
@@ -119,11 +126,28 @@ func (f *Files) Upload(ctx context.Context, in UploadInput) (model.Node, error) 
 
 // cleanupBlob 收回一次失败的登记：先删行，再删对象。
 func (f *Files) cleanupBlob(ctx context.Context, blobID uuid.UUID, storageKey string) {
-	deleted, err := f.store.DeleteBlobIfUnreferenced(ctx, blobID)
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	deleted, err := f.store.DeleteBlobIfUnreferenced(cleanupCtx, blobID)
 	if err != nil || !deleted {
 		return // 仍有别的节点引用，不删对象
 	}
-	_ = f.storage.Delete(ctx, storageKey)
+	_ = f.dropUploadObject(ctx, storageKey)
+}
+
+// dropUploadObject 回滚独占的对象。客户端断开或存储删除超时后仍可登记重试。
+func (f *Files) dropUploadObject(ctx context.Context, key string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	err := f.storage.Delete(cleanupCtx, key)
+	if err == nil || errors.Is(err, storage.ErrNotFound) {
+		return nil
+	}
+	queueCtx, cancelQueue := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancelQueue()
+	queueErr := f.store.QueueObject(queueCtx, f.backend, key)
+	f.logger.Warn("delete upload object", "key", key, "error", err, "queue_error", queueErr)
+	return err
 }
 
 // InstantInput 是一次秒传请求：按客户端提供的 SHA-256 复用已存内容。
@@ -150,7 +174,12 @@ func (f *Files) InstantUpload(ctx context.Context, in InstantInput) (model.Node,
 		return model.Node{}, err
 	}
 
-	blob, err := f.store.GetBlobByHash(ctx, hash)
+	var blob model.Blob
+	if f.AllowGlobalInstantUpload {
+		blob, err = f.store.GetBlobByHash(ctx, hash)
+	} else {
+		blob, err = f.store.GetOwnedBlobByHash(ctx, in.OwnerID, hash)
+	}
 	if errors.Is(err, repository.ErrNotFound) {
 		return model.Node{}, ErrContentNotStored
 	}
@@ -158,7 +187,7 @@ func (f *Files) InstantUpload(ctx context.Context, in InstantInput) (model.Node,
 		return model.Node{}, err
 	}
 	if in.Size != blob.Size {
-		return model.Node{}, invalid("size 与已存内容的实际大小不符")
+		return model.Node{}, ErrContentNotStored
 	}
 	if err := checkQuota(ctx, f.store, in.OwnerID, blob.Size); err != nil {
 		return model.Node{}, err
@@ -540,6 +569,31 @@ func getCompressionMethod(name string) uint16 {
 // checkParent 确认父目录存在、属于自己、且真的是个目录。
 func (f *Files) checkParent(ctx context.Context, ownerID uuid.UUID, parentID *uuid.UUID) error {
 	return checkParentDir(ctx, f.store, ownerID, parentID)
+}
+
+// quotaReader 到达限额后只探读一个字节，区分刚好读完与超额。
+type quotaReader struct {
+	r         io.Reader
+	remaining int64
+}
+
+func (q *quotaReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if q.remaining == 0 {
+		n, err := q.r.Read(p[:1])
+		if n > 0 {
+			return 0, ErrQuotaExceeded
+		}
+		return 0, err
+	}
+	if int64(len(p)) > q.remaining {
+		p = p[:q.remaining]
+	}
+	n, err := q.r.Read(p)
+	q.remaining -= int64(n)
+	return n, err
 }
 
 // countingReader 统计实际读取的字节数，作为 blob.size 的来源。

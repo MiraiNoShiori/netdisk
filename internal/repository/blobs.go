@@ -22,6 +22,14 @@ func (s *Store) GetBlobByHash(ctx context.Context, hash string) (model.Blob, err
 	return scanBlob(row)
 }
 
+// GetOwnedBlobByHash 只匹配当前用户仍有存活节点引用的内容。
+func (s *Store) GetOwnedBlobByHash(ctx context.Context, ownerID uuid.UUID, hash string) (model.Blob, error) {
+	return scanBlob(s.pool.QueryRow(ctx, `SELECT `+blobColumns+` FROM blobs
+ WHERE content_hash = $1 AND EXISTS (
+   SELECT 1 FROM nodes WHERE blob_id = blobs.id AND owner_id = $2 AND deleted_at IS NULL
+ )`, hash, ownerID))
+}
+
 // GetBlobByID 按 id 查询内容（下载时由 node.blob_id 反查）。
 func (s *Store) GetBlobByID(ctx context.Context, id uuid.UUID) (model.Blob, error) {
 	row := s.pool.QueryRow(ctx, `SELECT `+blobColumns+` FROM blobs WHERE id = $1`, id)
