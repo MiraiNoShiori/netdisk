@@ -78,6 +78,15 @@ sudo mount -t nfs -o vers=3,proto=tcp,port=2049,mountport=2049,nolock,actimeo=0 
 ### 局域网 P2P 点对点直传
 登录后点侧边栏的「局域网 P2P 直传」（`/p2p.html`），选好本机文件就能拿到一个 30 分钟有效的一次性链接。接收方不用登录，打开链接选好保存位置就开始直传。整个过程不走中继服务器，页面会实时显示速度和预计剩余时间，传完后还会核对 SHA-256。
 
+## Known Limitations / 安全边界
+
+- **账号和秒传**：已有账号建好后可设 `ALLOW_REGISTER=false` 关闭公开注册。默认仅能秒传自己仍有存活引用的内容。开启 `ALLOW_GLOBAL_INSTANT_UPLOAD=true` 后，知道其他用户文件哈希与大小的账号也能创建副本并下载。
+- **反向代理和 Cookie**：文件下载、同一路径的内联预览和文件夹 ZIP 可使用下载 Cookie，其他私有 API 需要 Bearer token。HTTPS 在反代终止时，可设 `COOKIE_SECURE=true`；使用 `auto` 时，仅直连 TLS 或来自 `TRUSTED_PROXY_CIDRS` 且标明 HTTPS 的请求启用 Secure。只填写实际代理的源地址，并在代理上覆盖客户端的 `X-Forwarded-Proto`。
+- **NFS**：网关使用 `willscott/go-nfs v0.0.4`，是轻量实验特性。一个实例导出一个账号的目录，访问控制依赖来源网段，适合受信局域网。
+- **P2P**：浏览器使用 WebRTC 直连，未配置 STUN/TURN。适用于两端可直接互通的网络；跨 NAT、防火墙或启用了客户端隔离的 Wi-Fi 可能无法建立连接。
+- **并发回收**：`Upload` / `InstantUpload` 的 blob 登记或查询与创建节点分步完成。在极高并发下，对象 GC 可能在这段窗口内回收内容。后续可通过事务锁或回收宽限期加固。
+- **PDF 预览**：同源内联响应已设置 `X-Content-Type-Options: nosniff`，PDF 仍由浏览器解析。公网多用户部署建议在反代配置严格的预览安全头，或使用独立预览域隔离用户内容。
+
 ## 跑全量测试
 
 想用真实的 PostgreSQL、MinIO 和 NFS 协议完整验一遍，直接起隔离测试环境跑验收脚本即可：
