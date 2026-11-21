@@ -3,7 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
-	"github.com/Miraitowa-kawayi/netdisk/migrations"
+	"github.com/MiraiNoShiori/netdisk/migrations"
 	"sort"
 )
 

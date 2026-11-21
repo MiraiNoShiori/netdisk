@@ -3,8 +3,8 @@ package handler
 import (
 	"net/http"
 
-	"github.com/Miraitowa-kawayi/netdisk/internal/httpx"
-	"github.com/Miraitowa-kawayi/netdisk/internal/middleware"
+	"github.com/MiraiNoShiori/netdisk/internal/httpx"
+	"github.com/MiraiNoShiori/netdisk/internal/middleware"
 )
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {

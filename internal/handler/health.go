@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/Miraitowa-kawayi/netdisk/internal/httpx"
+	"github.com/MiraiNoShiori/netdisk/internal/httpx"
 )
 
 // healthz 只表示进程存活，不检查依赖。

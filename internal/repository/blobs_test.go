@@ -7,7 +7,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/Miraitowa-kawayi/netdisk/internal/model"
+	"github.com/MiraiNoShiori/netdisk/internal/model"
 	"github.com/google/uuid"
 )
 

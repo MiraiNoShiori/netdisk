@@ -7,8 +7,8 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/Miraitowa-kawayi/netdisk/internal/model"
-	"github.com/Miraitowa-kawayi/netdisk/internal/repository"
+	"github.com/MiraiNoShiori/netdisk/internal/model"
+	"github.com/MiraiNoShiori/netdisk/internal/repository"
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 )

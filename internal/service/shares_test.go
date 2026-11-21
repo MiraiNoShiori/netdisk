@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Miraitowa-kawayi/netdisk/internal/model"
-	"github.com/Miraitowa-kawayi/netdisk/internal/repository"
-	"github.com/Miraitowa-kawayi/netdisk/internal/storage"
-	"github.com/Miraitowa-kawayi/netdisk/internal/testutil"
+	"github.com/MiraiNoShiori/netdisk/internal/model"
+	"github.com/MiraiNoShiori/netdisk/internal/repository"
+	"github.com/MiraiNoShiori/netdisk/internal/storage"
+	"github.com/MiraiNoShiori/netdisk/internal/testutil"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )

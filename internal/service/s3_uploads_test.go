@@ -3,7 +3,7 @@ package service
 import (
 	"bytes"
 	"errors"
-	"github.com/Miraitowa-kawayi/netdisk/internal/storage"
+	"github.com/MiraiNoShiori/netdisk/internal/storage"
 	"github.com/google/uuid"
 	"io"
 	"os"

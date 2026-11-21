@@ -5,7 +5,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/Miraitowa-kawayi/netdisk/internal/storage"
+	"github.com/MiraiNoShiori/netdisk/internal/storage"
 )
 
 // MaintenanceOptions 配置后台定期维护任务（回收站自动清理与热点文件智能分层）。

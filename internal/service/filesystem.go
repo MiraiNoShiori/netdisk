@@ -2,7 +2,7 @@ package service
 
 import (
 	"context"
-	"github.com/Miraitowa-kawayi/netdisk/internal/model"
+	"github.com/MiraiNoShiori/netdisk/internal/model"
 	"github.com/google/uuid"
 	"io"
 	"path"

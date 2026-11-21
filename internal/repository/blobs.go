@@ -3,7 +3,7 @@ package repository
 import (
 	"context"
 
-	"github.com/Miraitowa-kawayi/netdisk/internal/model"
+	"github.com/MiraiNoShiori/netdisk/internal/model"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )

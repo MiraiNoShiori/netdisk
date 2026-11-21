@@ -7,9 +7,9 @@ import (
 	"net"
 	"net/http"
 
-	"github.com/Miraitowa-kawayi/netdisk/internal/httpx"
-	"github.com/Miraitowa-kawayi/netdisk/internal/middleware"
-	"github.com/Miraitowa-kawayi/netdisk/internal/service"
+	"github.com/MiraiNoShiori/netdisk/internal/httpx"
+	"github.com/MiraiNoShiori/netdisk/internal/middleware"
+	"github.com/MiraiNoShiori/netdisk/internal/service"
 	"github.com/google/uuid"
 )
 

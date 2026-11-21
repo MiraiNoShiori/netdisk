@@ -14,9 +14,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Miraitowa-kawayi/netdisk/internal/httpx"
-	"github.com/Miraitowa-kawayi/netdisk/internal/repository"
-	"github.com/Miraitowa-kawayi/netdisk/internal/service"
+	"github.com/MiraiNoShiori/netdisk/internal/httpx"
+	"github.com/MiraiNoShiori/netdisk/internal/repository"
+	"github.com/MiraiNoShiori/netdisk/internal/service"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 )

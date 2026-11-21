@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Miraitowa-kawayi/netdisk/internal/httpx"
+	"github.com/MiraiNoShiori/netdisk/internal/httpx"
 	"github.com/google/uuid"
 )
 

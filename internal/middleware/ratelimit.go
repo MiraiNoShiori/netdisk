@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Miraitowa-kawayi/netdisk/internal/httpx"
+	"github.com/MiraiNoShiori/netdisk/internal/httpx"
 )
 
 // AuthLimit 只信任实际 TCP 来源，不接受客户端伪造的 X-Forwarded-For。

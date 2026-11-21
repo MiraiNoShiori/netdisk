@@ -4,8 +4,8 @@ package nfsgateway
 import (
 	"context"
 	"errors"
-	"github.com/Miraitowa-kawayi/netdisk/internal/model"
-	"github.com/Miraitowa-kawayi/netdisk/internal/service"
+	"github.com/MiraiNoShiori/netdisk/internal/model"
+	"github.com/MiraiNoShiori/netdisk/internal/service"
 	"github.com/go-git/go-billy/v5"
 	"github.com/google/uuid"
 	"io"

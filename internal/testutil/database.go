@@ -3,7 +3,7 @@ package testutil
 
 import (
 	"context"
-	"github.com/Miraitowa-kawayi/netdisk/internal/repository"
+	"github.com/MiraiNoShiori/netdisk/internal/repository"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"net/url"

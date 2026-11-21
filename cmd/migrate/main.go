@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
-	"github.com/Miraitowa-kawayi/netdisk/internal/config"
-	"github.com/Miraitowa-kawayi/netdisk/internal/repository"
+	"github.com/MiraiNoShiori/netdisk/internal/config"
+	"github.com/MiraiNoShiori/netdisk/internal/repository"
 	"log"
 )
 

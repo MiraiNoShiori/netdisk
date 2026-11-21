@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/Miraitowa-kawayi/netdisk/internal/httpx"
+	"github.com/MiraiNoShiori/netdisk/internal/httpx"
 	chimw "github.com/go-chi/chi/v5/middleware"
 )
 

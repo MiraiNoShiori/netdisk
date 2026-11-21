@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/Miraitowa-kawayi/netdisk/internal/model"
-	"github.com/Miraitowa-kawayi/netdisk/internal/storage"
+	"github.com/MiraiNoShiori/netdisk/internal/model"
+	"github.com/MiraiNoShiori/netdisk/internal/storage"
 	"github.com/google/uuid"
 )
 

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Miraitowa-kawayi/netdisk/internal/storage"
+	"github.com/MiraiNoShiori/netdisk/internal/storage"
 )
 
 type failOneDelete struct {

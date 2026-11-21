@@ -12,12 +12,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Miraitowa-kawayi/netdisk/internal/config"
-	"github.com/Miraitowa-kawayi/netdisk/internal/handler"
-	"github.com/Miraitowa-kawayi/netdisk/internal/nfsgateway"
-	"github.com/Miraitowa-kawayi/netdisk/internal/repository"
-	"github.com/Miraitowa-kawayi/netdisk/internal/service"
-	"github.com/Miraitowa-kawayi/netdisk/internal/storage"
+	"github.com/MiraiNoShiori/netdisk/internal/config"
+	"github.com/MiraiNoShiori/netdisk/internal/handler"
+	"github.com/MiraiNoShiori/netdisk/internal/nfsgateway"
+	"github.com/MiraiNoShiori/netdisk/internal/repository"
+	"github.com/MiraiNoShiori/netdisk/internal/service"
+	"github.com/MiraiNoShiori/netdisk/internal/storage"
 )
 
 func main() {

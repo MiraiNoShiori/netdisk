@@ -3,7 +3,7 @@ package handler
 import (
 	"net/http"
 
-	"github.com/Miraitowa-kawayi/netdisk/internal/httpx"
+	"github.com/MiraiNoShiori/netdisk/internal/httpx"
 )
 
 type registerRequest struct {

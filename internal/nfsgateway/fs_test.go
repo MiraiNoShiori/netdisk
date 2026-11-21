@@ -2,10 +2,10 @@ package nfsgateway
 
 import (
 	"context"
-	"github.com/Miraitowa-kawayi/netdisk/internal/repository"
-	"github.com/Miraitowa-kawayi/netdisk/internal/service"
-	"github.com/Miraitowa-kawayi/netdisk/internal/storage"
-	"github.com/Miraitowa-kawayi/netdisk/internal/testutil"
+	"github.com/MiraiNoShiori/netdisk/internal/repository"
+	"github.com/MiraiNoShiori/netdisk/internal/service"
+	"github.com/MiraiNoShiori/netdisk/internal/storage"
+	"github.com/MiraiNoShiori/netdisk/internal/testutil"
 	"github.com/google/uuid"
 	client "github.com/willscott/go-nfs-client/nfs"
 	"github.com/willscott/go-nfs-client/nfs/rpc"
