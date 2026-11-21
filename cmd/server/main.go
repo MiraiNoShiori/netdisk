@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -87,12 +89,9 @@ func run(logger *slog.Logger) error {
 	files := service.NewFiles(store, blobStore, cfg.StorageDriver, logger)
 	files.AllowGlobalInstantUpload = cfg.AllowGlobalInstantUpload
 	uploads := service.NewUploads(store, blobStore, cfg.StorageDriver, logger)
-	go uploads.RunCleanup(ctx, service.MaintenanceOptions{
-		Files:             files,
-		TrashRetention:    cfg.TrashRetention,
-		AutoTierThreshold: cfg.AutoTierThreshold,
-		AutoTierMinSize:   cfg.AutoTierMinSize,
-	})
+	var workers sync.WaitGroup
+	// HTTP 和 NFS 各自最多上报一次，停机期间上报也不会阻塞。
+	serverErr := make(chan error, 2)
 	shares := service.NewShares(store, files, logger)
 	if cfg.NFSAddr != "" {
 		user, err := store.GetUserByUsername(ctx, cfg.NFSUser)
@@ -105,12 +104,12 @@ func run(logger *slog.Logger) error {
 		}
 		defer listener.Close()
 		fs := nfsgateway.NewFS(ctx, files, user.ID, "")
-		go func() {
-			if err := nfsgateway.Serve(ctx, listener, fs); err != nil && ctx.Err() == nil {
-				logger.Error("NFS stopped", "error", err)
-				stop()
+		workers.Go(func() {
+			err := nfsgateway.Serve(ctx, listener, fs)
+			if err != nil && !(ctx.Err() != nil && (errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled))) {
+				serverErr <- fmt.Errorf("NFS serve: %w", err)
 			}
-		}()
+		})
 		logger.Info("NFS export listening", "addr", cfg.NFSAddr, "user", cfg.NFSUser)
 	}
 
@@ -129,24 +128,35 @@ func run(logger *slog.Logger) error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	serverErr := make(chan error, 1)
-	go func() {
+	workers.Go(func() {
+		uploads.RunCleanup(ctx, service.MaintenanceOptions{
+			Files:             files,
+			TrashRetention:    cfg.TrashRetention,
+			AutoTierThreshold: cfg.AutoTierThreshold,
+			AutoTierMinSize:   cfg.AutoTierMinSize,
+		})
+	})
+	workers.Go(func() {
 		logger.Info("netdisk listening", "addr", cfg.Addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
-			return
 		}
-		serverErr <- nil
-	}()
+	})
 
+	var serveErr error
 	select {
-	case err := <-serverErr:
-		return err
+	case serveErr = <-serverErr:
 	case <-ctx.Done():
-		logger.Info("shutting down")
 	}
-
+	stop()
+	logger.Info("shutting down")
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelShutdown()
-	return srv.Shutdown(shutdownCtx)
+	shutdownErr := srv.Shutdown(shutdownCtx)
+	workers.Wait()
+	close(serverErr)
+	for err := range serverErr {
+		serveErr = errors.Join(serveErr, err)
+	}
+	return errors.Join(serveErr, shutdownErr)
 }
