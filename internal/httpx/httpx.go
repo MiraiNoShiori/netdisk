@@ -82,6 +82,10 @@ type errorBody struct {
 
 // WriteJSON 写一个 JSON 响应。v 为 nil 时只写状态码。
 func WriteJSON(w http.ResponseWriter, status int, v any) {
+	if status == http.StatusNoContent {
+		w.WriteHeader(status)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	if v == nil {

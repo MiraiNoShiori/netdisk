@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime/multipart"
+	"mime/quotedprintable"
 	"net/http"
 	"net/url"
 	"path"
@@ -22,7 +24,11 @@ import (
 )
 
 // maxFieldBytes 限制普通表单字段（parent_id / name）的大小，文件本体不经过此限制。
-const maxFieldBytes = 64 << 10
+const (
+	maxFieldBytes    = 64 << 10
+	maxDiscardBytes  = 64 << 10
+	maxTrailingParts = 16
+)
 
 // uploadFile 处理 multipart/form-data 上传。
 // 用 r.MultipartReader() 边收边写，不用 ParseMultipartForm()，避免整个请求体进内存或临时文件。
@@ -34,6 +40,12 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 文件本体可流式读取；文件提交后也给尾随 MIME 头和分隔符设定读取预算。
+	wire := &io.LimitedReader{R: r.Body, N: math.MaxInt64}
+	r.Body = struct {
+		io.Reader
+		io.Closer
+	}{wire, r.Body}
 	mr, err := r.MultipartReader()
 	if err != nil {
 		httpx.Fail(w, r, s.deps.Logger, httpx.Invalid("需要 multipart/form-data 请求体").With(err))
@@ -46,9 +58,10 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := r.URL.Query().Get("name")
+	remaining := int64(maxDiscardBytes)
 
 	for {
-		part, err := mr.NextPart()
+		part, err := mr.NextRawPart()
 		if errors.Is(err, io.EOF) {
 			break
 		}
@@ -59,8 +72,7 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 
 		// 带文件名的部分即文件本体，其余为表单字段。
 		if part.FileName() == "" && part.FormName() != "file" {
-			if err := s.consumeField(part, &parentID, &name); err != nil {
-				_ = part.Close()
+			if err := s.consumeField(part, &parentID, &name, &remaining); err != nil {
 				httpx.Fail(w, r, s.deps.Logger, httpx.Invalid(err.Error()))
 				return
 			}
@@ -79,15 +91,15 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 			ParentID: parentID,
 			Name:     uploadName,
 			SizeHint: -1, // -1：multipart 拿不到大小，真实大小由 service 边读边数
-			Body:     part,
+			Body:     partContent(part, part),
 		})
-		_ = part.Close()
 		if err != nil {
 			s.failService(w, r, err)
 			return
 		}
 
-		drainParts(mr) // 读完剩余部分，保持连接可复用
+		wire.N = remaining
+		drainParts(mr, remaining) // 文件已提交，尽量在剩余预算内复用连接
 		httpx.WriteJSON(w, http.StatusCreated, map[string]any{"node": node})
 		return
 	}
@@ -95,17 +107,28 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 	httpx.Fail(w, r, s.deps.Logger, httpx.Invalid(`缺少 "file" 部分`))
 }
 
+// 保留 NextPart 对已识别内容的解码行为；丢弃未知字段时按原始字节计费。
+func partContent(part *multipart.Part, raw io.Reader) io.Reader {
+	if strings.EqualFold(part.Header.Get("Content-Transfer-Encoding"), "quoted-printable") {
+		return quotedprintable.NewReader(raw)
+	}
+	return raw
+}
+
 // consumeField 读一个普通字段，值写回 parentID / name。
-func (s *Server) consumeField(part *multipart.Part, parentID **uuid.UUID, name *string) error {
+func (s *Server) consumeField(part *multipart.Part, parentID **uuid.UUID, name *string, remaining *int64) error {
 	key := part.FormName()
 	if key != "parent_id" && key != "name" {
-		_, _ = io.Copy(io.Discard, part) // 不认识的字段读掉，保持流位置
-		return nil
+		return discardPart(part, remaining)
 	}
 
-	raw, err := io.ReadAll(io.LimitReader(part, maxFieldBytes))
+	limited := &io.LimitedReader{R: part, N: maxFieldBytes + 1}
+	raw, err := io.ReadAll(partContent(part, limited))
 	if err != nil {
 		return fmt.Errorf("读取表单字段 %s 失败", key)
+	}
+	if limited.N == 0 {
+		return fmt.Errorf("表单字段 %s 超过 %d 字节", key, maxFieldBytes)
 	}
 	value := strings.TrimSpace(string(raw))
 
@@ -121,14 +144,22 @@ func (s *Server) consumeField(part *multipart.Part, parentID **uuid.UUID, name *
 	return nil
 }
 
-func drainParts(mr *multipart.Reader) {
-	for {
-		part, err := mr.NextPart()
-		if err != nil {
+// 未读完的 Part.Close 会把余下内容全部读掉；触及上限后直接返回。
+func discardPart(part *multipart.Part, remaining *int64) error {
+	n, err := io.Copy(io.Discard, io.LimitReader(part, *remaining+1))
+	if n > *remaining {
+		return fmt.Errorf("丢弃的表单字段合计超过 %d 字节", maxDiscardBytes)
+	}
+	*remaining -= n
+	return err
+}
+
+func drainParts(mr *multipart.Reader, remaining int64) {
+	for range maxTrailingParts {
+		part, err := mr.NextRawPart()
+		if err != nil || discardPart(part, &remaining) != nil {
 			return
 		}
-		_, _ = io.Copy(io.Discard, part)
-		_ = part.Close()
 	}
 }
 

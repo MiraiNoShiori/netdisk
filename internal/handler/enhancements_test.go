@@ -179,7 +179,9 @@ func TestHTTPEnhancementsEndToEnd(t *testing.T) {
 	call("GET", "/api/v1/shares/"+sh.Share.ID+"/analytics", token, nil, 200)
 
 	// 回收站：软删 -> 列表 -> 恢复 -> 永久删除。
-	call("DELETE", "/api/v1/files/"+nodeResp.Node.ID, token, nil, 204)
+	if w := call("DELETE", "/api/v1/files/"+nodeResp.Node.ID, token, nil, 204); w.Body.Len() != 0 {
+		t.Fatalf("delete body = %q", w.Body.String())
+	}
 	call("GET", "/api/v1/trash/", token, nil, 200)
 	call("POST", "/api/v1/trash/"+nodeResp.Node.ID+"/restore", token, nil, 200)
 	call("DELETE", "/api/v1/files/"+nodeResp.Node.ID+"?permanent=true", token, nil, 204)

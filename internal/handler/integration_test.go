@@ -12,8 +12,10 @@ import (
 	"github.com/google/uuid"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"strings"
 	"testing"
 	"time"
@@ -80,6 +82,31 @@ func TestHTTPAccountUploadShareAndIsolation(t *testing.T) {
 		t.Fatal("download cookie flags")
 	}
 	token := session.Token
+
+	// 文件已经入库后，大段尾随 MIME 头也不能触发无限读取。
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	part, err := form.CreateFormFile("file", "tail.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(part, "ok"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := form.CreatePart(textproto.MIMEHeader{"X-Extra": []string{strings.Repeat("x", 3*maxDiscardBytes)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := form.Close(); err != nil {
+		t.Fatal(err)
+	}
+	uploadReq := httptest.NewRequest("POST", "/api/v1/files/", &body)
+	uploadReq.Header.Set("Content-Type", form.FormDataContentType())
+	uploadReq.Header.Set("Authorization", "Bearer "+token)
+	uploaded := httptest.NewRecorder()
+	router.ServeHTTP(uploaded, uploadReq)
+	if uploaded.Code != 201 || body.Len() < maxDiscardBytes {
+		t.Fatalf("upload with tail: status=%d unread=%d", uploaded.Code, body.Len())
+	}
 	created := call("POST", "/api/v1/uploads/", token, map[string]any{"name": "demo.txt", "total_size": 6, "chunk_size": 3}, 201)
 	var upload struct {
 		Session struct {
