@@ -1,6 +1,9 @@
-# 本地开发依赖：PostgreSQL 与（可选的）MinIO
-#
-# 服务启动时自动增量迁移；也可 go run ./cmd/migrate，不要为升级删除数据卷。
+# 一键启动完整 NetDisk + PostgreSQL：
+#   docker compose up -d
+# 仅启动数据库供本地 `go run ./cmd/server` 开发：
+#   docker compose up -d postgres
+# 附带 MinIO 对象存储一起启动：
+#   docker compose --profile objectstore up -d --build
 
 services:
   postgres:
@@ -10,7 +13,7 @@ services:
       POSTGRES_USER: netdisk
       POSTGRES_PASSWORD: netdisk
       POSTGRES_DB: netdisk
-    # 宿主机 5433，避开 5432
+    # 宿主机映射 5433，避免和本机默认 5432 冲突
     ports:
       - "5433:5432"
     volumes:
@@ -21,7 +24,29 @@ services:
       timeout: 3s
       retries: 10
 
-  # 对象存储，用 --profile objectstore 启用
+  netdisk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: netdisk-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NETDISK_ADDR: ":8081"
+      NETDISK_DATABASE_URL: postgres://netdisk:netdisk@postgres:5432/netdisk?sslmode=disable
+      NETDISK_JWT_SECRET: ${NETDISK_JWT_SECRET:-change-me-in-production-use-random-hex}
+      NETDISK_STORAGE_DRIVER: ${NETDISK_STORAGE_DRIVER:-local}
+      NETDISK_STORAGE_DIR: /app/data/blobs
+      NETDISK_ALLOW_REGISTER: ${NETDISK_ALLOW_REGISTER:-true}
+      NETDISK_COOKIE_SECURE: ${NETDISK_COOKIE_SECURE:-auto}
+    ports:
+      - "8081:8081"
+    volumes:
+      - netdisk-blobs:/app/data
+    restart: unless-stopped
+
+  # 可选对象存储，用 --profile objectstore 启用
   minio:
     build:
       context: .
@@ -40,4 +65,5 @@ services:
 
 volumes:
   postgres-data:
+  netdisk-blobs:
   minio-data:
