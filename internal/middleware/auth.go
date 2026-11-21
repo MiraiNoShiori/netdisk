@@ -25,10 +25,19 @@ const (
 // RequireAuth 校验 Authorization: Bearer <token>，通过后把用户 id 与原始 token 放进 context；
 // 失败一律 401，不区分缺少、签名错误或过期。
 func RequireAuth(logger *slog.Logger, tp TokenParser) func(http.Handler) http.Handler {
+	return requireAuth(logger, tp, false)
+}
+
+// RequireDownloadAuth 供浏览器直接打开的下载、预览与 ZIP 路由使用。
+func RequireDownloadAuth(logger *slog.Logger, tp TokenParser) func(http.Handler) http.Handler {
+	return requireAuth(logger, tp, true)
+}
+
+func requireAuth(logger *slog.Logger, tp TokenParser, allowCookie bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			raw, ok := bearerToken(r)
-			if !ok && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			if !ok && allowCookie && r.Header.Get("Authorization") == "" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
 				if c, err := r.Cookie("netdisk_download"); err == nil {
 					raw = c.Value
 					ok = true

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/MiraiNoShiori/netdisk/internal/httpx"
 	"github.com/MiraiNoShiori/netdisk/internal/middleware"
@@ -17,7 +18,7 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 		s.failService(w, r, err)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{Name: "netdisk_download", Path: "/api/v1", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	s.setDownloadCookie(w, r, "", time.Time{}, -1)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -54,7 +55,7 @@ func (s *Server) password(w http.ResponseWriter, r *http.Request) {
 		s.failService(w, r, err)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{Name: "netdisk_download", Path: "/api/v1", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	s.setDownloadCookie(w, r, "", time.Time{}, -1)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -74,6 +75,6 @@ func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	for _, room := range s.deps.Peers.List(id) {
 		_ = s.deps.Peers.Delete(id, room.ID)
 	}
-	http.SetCookie(w, &http.Cookie{Name: "netdisk_download", Path: "/api/v1", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	s.setDownloadCookie(w, r, "", time.Time{}, -1)
 	w.WriteHeader(http.StatusNoContent)
 }

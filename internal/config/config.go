@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/MiraiNoShiori/netdisk/internal/storage"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -14,6 +15,9 @@ import (
 
 // Config 是服务启动所需的全部配置。
 type Config struct {
+	AllowRegister                bool
+	CookieSecure                 string
+	TrustedProxyCIDRs            []netip.Prefix
 	AllowGlobalInstantUpload     bool
 	Addr                         string
 	DatabaseURL                  string
@@ -87,6 +91,25 @@ func Load() (*Config, error) {
 		StorageDir:        envOr("NETDISK_STORAGE_DIR", "./data/blobs"),
 	}
 
+	cfg.AllowRegister, err = strconv.ParseBool(envOr("ALLOW_REGISTER", "true"))
+	if err != nil {
+		return nil, fmt.Errorf("ALLOW_REGISTER: %w", err)
+	}
+	cfg.CookieSecure = strings.ToLower(strings.TrimSpace(envOr("COOKIE_SECURE", "auto")))
+	switch cfg.CookieSecure {
+	case "auto", "true", "false":
+	default:
+		return nil, fmt.Errorf("COOKIE_SECURE must be auto, true or false")
+	}
+	if raw := envOr("TRUSTED_PROXY_CIDRS", ""); raw != "" {
+		for _, cidr := range strings.Split(raw, ",") {
+			prefix, err := netip.ParsePrefix(strings.TrimSpace(cidr))
+			if err != nil {
+				return nil, fmt.Errorf("TRUSTED_PROXY_CIDRS: %w", err)
+			}
+			cfg.TrustedProxyCIDRs = append(cfg.TrustedProxyCIDRs, prefix)
+		}
+	}
 	cfg.AllowGlobalInstantUpload, err = strconv.ParseBool(envOr("ALLOW_GLOBAL_INSTANT_UPLOAD", "false"))
 	if err != nil {
 		return nil, fmt.Errorf("ALLOW_GLOBAL_INSTANT_UPLOAD: %w", err)

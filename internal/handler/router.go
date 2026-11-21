@@ -93,19 +93,22 @@ func NewRouter(deps Deps) http.Handler {
 		r.Post("/p2p/{token}/answer", s.answerPeer)
 
 		r.Route("/files", func(r chi.Router) {
-			r.Use(requireAuth)
-			r.Post("/", s.uploadFile)           // multipart 上传，流式
-			r.Post("/dirs", s.createDir)        // 新建文件夹（JSON）
-			r.Post("/instant", s.instantUpload) // 秒传：报 hash，命中则不收字节（JSON）
-			r.Get("/folders", s.listFolders)    // 所有目录列表，供目录树选择器
-			r.Get("/", s.listFiles)             // 支持 parent_id / q / type / sort / order / limit / offset
-			r.Get("/{id}/ancestors", s.fileAncestors)
-			r.Get("/{id}/download", s.downloadFile) // ServeContent 提供 Range/206，支持 ?inline=1 安全预览
-			r.Post("/{id}/migrate", s.migrateFile)
-			r.Get("/{id}/direct-url", s.directURL)
-			r.Get("/{id}/zip", s.downloadZip) // 整棵子树打包成 zip（单查询流式，无 Range）
-			r.Patch("/{id}", s.patchFile)     // 改名和/或移动
-			r.Delete("/{id}", s.deleteFile)   // 移入回收站；?permanent=true 立即彻底删除
+			downloadAuth := middleware.RequireDownloadAuth(deps.Logger, deps.Auth)
+			r.With(downloadAuth).Get("/{id}/download", s.downloadFile) // ServeContent 提供 Range/206，支持 ?inline=1 安全预览
+			r.With(downloadAuth).Get("/{id}/zip", s.downloadZip)       // 整棵子树打包成 zip（单查询流式，无 Range）
+			r.Group(func(r chi.Router) {
+				r.Use(requireAuth)
+				r.Post("/", s.uploadFile)           // multipart 上传，流式
+				r.Post("/dirs", s.createDir)        // 新建文件夹（JSON）
+				r.Post("/instant", s.instantUpload) // 秒传：报 hash，命中则不收字节（JSON）
+				r.Get("/folders", s.listFolders)    // 所有目录列表，供目录树选择器
+				r.Get("/", s.listFiles)             // 支持 parent_id / q / type / sort / order / limit / offset
+				r.Get("/{id}/ancestors", s.fileAncestors)
+				r.Post("/{id}/migrate", s.migrateFile)
+				r.Get("/{id}/direct-url", s.directURL)
+				r.Patch("/{id}", s.patchFile)   // 改名和/或移动
+				r.Delete("/{id}", s.deleteFile) // 移入回收站；?permanent=true 立即彻底删除
+			})
 		})
 
 		// 回收站：列出、恢复子树、彻底删除单项、一键清空。

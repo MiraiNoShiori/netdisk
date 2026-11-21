@@ -36,7 +36,7 @@ func TestHTTPAccountUploadShareAndIsolation(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	auth := service.NewAuth(st, service.NewTokens("test-key", time.Hour))
 	files := service.NewFiles(st, local, "local", log)
-	router := NewRouter(Deps{Cfg: &config.Config{}, Logger: log, Store: st, Auth: auth, Files: files, Uploads: service.NewUploads(st, local, "local", log), Shares: service.NewShares(st, files, log)})
+	router := NewRouter(Deps{Cfg: &config.Config{AllowRegister: true, CookieSecure: "true"}, Logger: log, Store: st, Auth: auth, Files: files, Uploads: service.NewUploads(st, local, "local", log), Shares: service.NewShares(st, files, log)})
 	call := func(method, path, token string, body any, want int) *httptest.ResponseRecorder {
 		t.Helper()
 		var data io.Reader
@@ -78,11 +78,10 @@ func TestHTTPAccountUploadShareAndIsolation(t *testing.T) {
 	}
 	json.Unmarshal(login.Body.Bytes(), &session)
 	cookie := login.Result().Cookies()[0]
-	if !cookie.HttpOnly || cookie.SameSite != http.SameSiteStrictMode {
+	if !cookie.Secure || !cookie.HttpOnly || cookie.SameSite != http.SameSiteStrictMode {
 		t.Fatal("download cookie flags")
 	}
 	token := session.Token
-
 	// 文件已经入库后，大段尾随 MIME 头也不能触发无限读取。
 	var body bytes.Buffer
 	form := multipart.NewWriter(&body)
@@ -107,6 +106,7 @@ func TestHTTPAccountUploadShareAndIsolation(t *testing.T) {
 	if uploaded.Code != 201 || body.Len() < maxDiscardBytes {
 		t.Fatalf("upload with tail: status=%d unread=%d", uploaded.Code, body.Len())
 	}
+
 	created := call("POST", "/api/v1/uploads/", token, map[string]any{"name": "demo.txt", "total_size": 6, "chunk_size": 3}, 201)
 	var upload struct {
 		Session struct {
@@ -138,6 +138,15 @@ func TestHTTPAccountUploadShareAndIsolation(t *testing.T) {
 		t.Fatalf("download range %d %s", w.Code, w.Body.String())
 	}
 	call("GET", url+"/download", "", nil, 401)
+	for path, want := range map[string]int{"/api/v1/auth/me": 401, "/api/v1/files/": 401, url + "/direct-url": 401, url + "/zip": 400} {
+		req := httptest.NewRequest("GET", path, nil)
+		req.AddCookie(cookie)
+		res := httptest.NewRecorder()
+		router.ServeHTTP(res, req)
+		if res.Code != want {
+			t.Fatalf("cookie GET %s = %d, want %d", path, res.Code, want)
+		}
+	}
 	share := call("POST", "/api/v1/shares/", token, map[string]any{"node_id": node.File.ID}, 201)
 	var sh struct {
 		Share struct {
@@ -147,6 +156,10 @@ func TestHTTPAccountUploadShareAndIsolation(t *testing.T) {
 	json.Unmarshal(share.Body.Bytes(), &sh)
 	call("GET", "/api/v1/share/"+sh.Share.Token+"/download", "", nil, 200)
 	call("GET", "/api/v1/share/"+sh.Share.Token+"/download?node_id="+uuid.NewString(), "", nil, 404)
-	call("POST", "/api/v1/auth/logout", token, nil, 204)
+	logout := call("POST", "/api/v1/auth/logout", token, nil, 204)
+	cleared := logout.Result().Cookies()
+	if len(cleared) != 1 || cleared[0].Name != cookie.Name || cleared[0].Path != cookie.Path || cleared[0].MaxAge != -1 || !cleared[0].HttpOnly || cleared[0].Secure != cookie.Secure || cleared[0].SameSite != cookie.SameSite {
+		t.Fatalf("logout cookie flags: %+v", cleared)
+	}
 	call("GET", url+"/download", token, nil, 401)
 }

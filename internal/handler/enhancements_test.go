@@ -48,7 +48,7 @@ func TestHTTPEnhancementsEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := &config.Config{JWTSecret: "test-key", CORSOrigins: []string{"https://ui.example.com"}}
+	cfg := &config.Config{AllowRegister: true, JWTSecret: "test-key", CORSOrigins: []string{"https://ui.example.com"}}
 	auth := service.NewAuthWithOptions(st, service.NewTokens(cfg.JWTSecret, time.Hour), 24*time.Hour, 10<<20)
 	files := service.NewFiles(st, local, "local", log)
 	router := NewRouter(Deps{
