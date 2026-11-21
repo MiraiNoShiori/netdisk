@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -172,14 +171,24 @@ func TestDeleteThenStatNotFound(t *testing.T) {
 	}
 }
 
-func TestKeyCannotEscapeRoot(t *testing.T) {
+func TestKeyRejectsInvalidSegments(t *testing.T) {
 	l := newTestLocal(t)
-	p, err := l.keyPath("../../etc/passwd")
-	if err != nil {
-		return // 直接报错也算安全
+	for _, key := range []string{"", "/", ".", "..", "../../secret", "a/../b", `a\b`, "/a", "a//b", "a/", "a/./b"} {
+		if p, err := l.keyPath(key); err == nil {
+			t.Errorf("keyPath(%q) = %q, want error", key, p)
+		}
 	}
-	rel, err := filepath.Rel(l.dir, p)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		t.Errorf("keyPath(%q) = %q，逃出了根目录", "../../etc/passwd", p)
+}
+
+func TestDirectoryIsNotAnObject(t *testing.T) {
+	l := newTestLocal(t)
+	if err := os.Mkdir(filepath.Join(l.dir, "folder"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if rc, _, err := l.Open(t.Context(), "folder"); rc != nil || !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Open = %v, %v", rc, err)
+	}
+	if _, err := l.Stat(t.Context(), "folder"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Stat = %v", err)
 	}
 }

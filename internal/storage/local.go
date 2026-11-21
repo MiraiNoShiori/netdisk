@@ -7,8 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 )
@@ -28,15 +28,19 @@ func NewLocal(dir string) (*Local, error) {
 	return &Local{dir: dir}, nil
 }
 
-// keyPath 把 key 映射成磁盘路径；path.Clean("/"+key) 使 key 无法逃出 l.dir。
+// keyPath 只接受由非空普通路径段组成的相对对象名。
 func (l *Local) keyPath(key string) (string, error) {
-	if key == "" {
-		return "", errors.New("storage: empty key")
+	if key == "." || !fs.ValidPath(key) || strings.Contains(key, "\\") {
+		return "", fmt.Errorf("storage: invalid key %q", key)
 	}
-	p := filepath.Join(l.dir, filepath.FromSlash(path.Clean("/"+key)))
+	local, err := filepath.Localize(key)
+	if err != nil {
+		return "", err
+	}
+	p := filepath.Join(l.dir, local)
 
 	rel, err := filepath.Rel(l.dir, p)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("storage: key %q escapes the root", key)
 	}
 	return p, nil
@@ -61,13 +65,12 @@ func (l *Local) Put(ctx context.Context, key string, r io.Reader, size int64) (s
 	if err != nil {
 		return "", fmt.Errorf("storage: create temp file: %w", err)
 	}
-	defer tempFile.Close()
 
 	// defer 清理临时文件，如果出错或中途取消
 	var success bool
 	defer func() {
-		tempFile.Close()
 		if !success {
+			tempFile.Close()
 			os.Remove(tempFile.Name())
 		}
 	}()
@@ -108,7 +111,7 @@ func (l *Local) Open(ctx context.Context, key string) (io.ReadSeekCloser, Object
 
 	f, err := os.Open(destPath)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil, ObjectInfo{}, ErrNotFound
 		}
 		return nil, ObjectInfo{}, err
@@ -118,6 +121,11 @@ func (l *Local) Open(ctx context.Context, key string) (io.ReadSeekCloser, Object
 	if err != nil {
 		f.Close()
 		return nil, ObjectInfo{}, err
+	}
+
+	if fi.IsDir() {
+		f.Close()
+		return nil, ObjectInfo{}, ErrNotFound
 	}
 
 	info := ObjectInfo{
@@ -152,6 +160,9 @@ func (l *Local) Stat(ctx context.Context, key string) (ObjectInfo, error) {
 			return ObjectInfo{}, ErrNotFound
 		}
 		return ObjectInfo{}, err
+	}
+	if fi.IsDir() {
+		return ObjectInfo{}, ErrNotFound
 	}
 	return ObjectInfo{Key: key, Size: fi.Size()}, nil
 }
@@ -193,7 +204,7 @@ func (l *Local) Concat(ctx context.Context, dstKey string, srcKeys []string) (st
 		if err != nil {
 			return "", 0, err // 源不存在时直接返回 ErrNotFound，不留半成品
 		}
-		n, err := io.Copy(mw, src)
+		n, err := io.Copy(mw, &ctxReader{ctx: ctx, r: src})
 		src.Close()
 		if err != nil {
 			return "", 0, fmt.Errorf("storage: concat %q: %w", key, err)
