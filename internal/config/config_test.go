@@ -58,3 +58,36 @@ func TestDeploymentOptions(t *testing.T) {
 		})
 	}
 }
+
+func TestMaxConcurrentZipsConfig(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("NETDISK_DATABASE_URL", "test")
+	t.Setenv("NETDISK_JWT_SECRET", "test")
+	t.Setenv("NETDISK_MAX_CONCURRENT_ZIPS", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxConcurrentZips != 4 {
+		t.Fatalf("default MaxConcurrentZips = %d, want 4", cfg.MaxConcurrentZips)
+	}
+
+	t.Setenv("NETDISK_MAX_CONCURRENT_ZIPS", "8")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxConcurrentZips != 8 {
+		t.Fatalf("override MaxConcurrentZips = %d, want 8", cfg.MaxConcurrentZips)
+	}
+
+	for _, bad := range []string{"0", "-1", "invalid"} {
+		t.Run(bad, func(t *testing.T) {
+			t.Setenv("NETDISK_MAX_CONCURRENT_ZIPS", bad)
+			if _, err := Load(); err == nil {
+				t.Fatalf("invalid NETDISK_MAX_CONCURRENT_ZIPS=%q accepted", bad)
+			}
+		})
+	}
+}

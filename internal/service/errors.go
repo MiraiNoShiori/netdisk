@@ -36,6 +36,8 @@ var (
 	ErrSharePasswordInvalid = errors.New("invalid share password")
 	// ErrShareLimitReached 该分享链接已达到最大下载次数上限。
 	ErrShareLimitReached = errors.New("share download limit reached")
+	// ErrTooManyZips 并发目录 ZIP 打包数量达到上限。
+	ErrTooManyZips = errors.New("too many concurrent zip downloads")
 )
 
 // ValidationError 是参数校验错误，Msg 可直接展示给用户。

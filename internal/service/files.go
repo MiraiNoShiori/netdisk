@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MiraiNoShiori/netdisk/internal/model"
@@ -19,7 +20,11 @@ import (
 	"github.com/google/uuid"
 )
 
-const maxNameLen = 255
+const (
+	maxNameLen               = 255
+	defaultMaxConcurrentZips = 4
+	zipCopyBufSize           = 32 << 10
+)
 
 // Files 实现文件的上传、下载、改名、删除、回收站、检索与打包下载。
 type Files struct {
@@ -28,10 +33,26 @@ type Files struct {
 	storage                  storage.Storage
 	backend                  string // 写进 blobs.backend，local | s3
 	logger                   *slog.Logger
+	zipSem                   chan struct{}
 }
 
 func NewFiles(store *repository.Store, st storage.Storage, backend string, logger *slog.Logger) *Files {
-	return &Files{store: store, storage: st, backend: backend, logger: logger}
+	return &Files{
+		store:   store,
+		storage: st,
+		backend: backend,
+		logger:  logger,
+		zipSem:  make(chan struct{}, defaultMaxConcurrentZips),
+	}
+}
+
+// SetMaxConcurrentZips 配置同时进行的流式 ZIP 打包上限；须在启动阶段调用。
+// n <= 0 时使用默认值，避免慢速下载占满无界 goroutine 或 CPU。
+func (f *Files) SetMaxConcurrentZips(n int) {
+	if n <= 0 {
+		n = defaultMaxConcurrentZips
+	}
+	f.zipSem = make(chan struct{}, n)
 }
 
 // checkQuota 校验用户新增 delta 字节后是否超过存储配额；quota <= 0 表示不限制。
@@ -451,8 +472,9 @@ type ZipDownload struct {
 
 // OpenZip 打开一个文件夹的打包下载。
 //
-// 校验（节点存在、属于调用者、是目录）与整棵子树元数据查询在返回前一次完成（消除 N+1 查询）；
-// 随后经 io.Pipe 在后台流式写入各个文件内容，内存仍保持 O(1)。
+// 校验（节点存在、属于调用者、是目录）、并发信号量占用与整棵子树元数据查询在返回前一次完成
+// （消除 N+1 查询）；随后经 io.Pipe 在后台流式写入各个文件内容，内存仍保持 O(1)。
+// 客户端断连或调用方提前 Close 时会立即取消打包上下文、关闭管道并等待写端退出，避免 goroutine 泄漏。
 func (f *Files) OpenZip(ctx context.Context, ownerID, id uuid.UUID) (ZipDownload, error) {
 	root, err := f.store.GetNode(ctx, ownerID, id)
 	if errors.Is(err, repository.ErrNotFound) {
@@ -465,34 +487,149 @@ func (f *Files) OpenZip(ctx context.Context, ownerID, id uuid.UUID) (ZipDownload
 		return ZipDownload{}, ErrNotADirectory
 	}
 
+	release, err := f.acquireZipSlot(ctx)
+	if err != nil {
+		return ZipDownload{}, err
+	}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			release()
+		}
+	}()
+
 	entries, err := f.store.ListSubtreeWithBlobs(ctx, ownerID, root.ID)
 	if err != nil {
 		return ZipDownload{}, err
 	}
 
+	handedOff = true
+	return f.startZipStream(ctx, root.Name+".zip", entries, release), nil
+}
+
+// acquireZipSlot 尝试占用一个并发 ZIP 打包槽位；槽满立即返回 ErrTooManyZips。
+func (f *Files) acquireZipSlot(ctx context.Context) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	sem := f.zipSem
+	if sem == nil {
+		return func() {}, nil
+	}
+	select {
+	case sem <- struct{}{}:
+		var once sync.Once
+		return func() {
+			once.Do(func() { <-sem })
+		}, nil
+	default:
+		return nil, ErrTooManyZips
+	}
+}
+
+// openZipEntries 在获取并发槽位后直接按条目流式生成 ZIP（便于单元测试覆盖管道与并发边界）。
+func (f *Files) openZipEntries(ctx context.Context, name string, entries []model.ZipEntry) (ZipDownload, error) {
+	release, err := f.acquireZipSlot(ctx)
+	if err != nil {
+		return ZipDownload{}, err
+	}
+	return f.startZipStream(ctx, name, entries, release), nil
+}
+
+// startZipStream 启动后台 ZIP 生产 goroutine，并把读端生命周期、ctx 取消与槽位释放绑定在一起。
+func (f *Files) startZipStream(ctx context.Context, name string, entries []model.ZipEntry, release func()) ZipDownload {
+	zipCtx, cancelZip := context.WithCancel(ctx)
 	pr, pw := io.Pipe()
+	// 请求上下文取消或消费端关闭时立即关闭管道读端，确保阻塞在 pw.Write 的生产端立刻失败退出。
+	stopCancel := context.AfterFunc(zipCtx, func() {
+		_ = pr.CloseWithError(zipCtx.Err())
+	})
+	done := make(chan struct{})
+
 	go func() {
+		defer close(done)
+		if release != nil {
+			defer release()
+		}
+		// 先注销 AfterFunc 再释放 zipCtx，避免正常结束时误将读端标为已取消。
+		defer cancelZip()
+		defer stopCancel()
+
+		closed := false
+		defer func() {
+			if !closed {
+				_ = pw.CloseWithError(errors.New("zip producer aborted"))
+			}
+		}()
+
 		zw := zip.NewWriter(pw)
 		// 出错时不再调用 zw.Close：否则读端会拿到一个空但合法的 zip。
-		if err := f.writeZipEntries(ctx, zw, entries); err != nil {
+		if err := f.writeZipEntries(zipCtx, zw, entries); err != nil {
+			closed = true
+			_ = pw.CloseWithError(err)
+			return
+		}
+		if err := zipCtx.Err(); err != nil {
+			closed = true
 			_ = pw.CloseWithError(err)
 			return
 		}
 		if err := zw.Close(); err != nil {
+			closed = true
 			_ = pw.CloseWithError(err)
 			return
 		}
+		closed = true
 		_ = pw.Close()
 	}()
 
-	return ZipDownload{Name: root.Name + ".zip", Content: pr}, nil
+	return ZipDownload{
+		Name: name,
+		Content: &zipReadCloser{
+			pr:        pr,
+			parentCtx: ctx,
+			cancel:    cancelZip,
+			done:      done,
+		},
+	}
+}
+
+// zipReadCloser 包装管道读端，确保 Close 时立即解除写端阻塞、取消打包上下文并回收生产 goroutine。
+type zipReadCloser struct {
+	pr        *io.PipeReader
+	parentCtx context.Context
+	cancel    context.CancelFunc
+	done      <-chan struct{}
+	once      sync.Once
+	closeErr  error
+}
+
+func (z *zipReadCloser) Read(p []byte) (int, error) {
+	n, err := z.pr.Read(p)
+	if errors.Is(err, io.ErrClosedPipe) && z.parentCtx.Err() != nil {
+		return n, z.parentCtx.Err()
+	}
+	return n, err
+}
+
+func (z *zipReadCloser) Close() error {
+	z.once.Do(func() {
+		z.closeErr = z.pr.Close()
+		z.cancel()
+		<-z.done
+	})
+	return z.closeErr
 }
 
 // writeZipEntries 顺序将子树条目流式写入 zw。
+// 在条目间与每个分块读写间监听 ctx.Done()，并把任意写错误视为终止条件。
 func (f *Files) writeZipEntries(ctx context.Context, zw *zip.Writer, entries []model.ZipEntry) error {
+	buf := make([]byte, zipCopyBufSize)
 	for _, entry := range entries {
-		if err := ctx.Err(); err != nil {
-			return err
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
 		}
 		if entry.IsDir {
 			dirHeader := &zip.FileHeader{
@@ -518,19 +655,52 @@ func (f *Files) writeZipEntries(ctx context.Context, zw *zip.Writer, entries []m
 		if entry.StorageKey == "" {
 			continue
 		}
-		if err := func() error {
-			reader, _, err := storage.OpenFrom(ctx, f.storage, entry.Backend, entry.StorageKey)
-			if err != nil {
-				return fmt.Errorf("open file content: %w", err)
-			}
-			defer reader.Close()
-			_, err = io.Copy(writer, reader)
-			return err
-		}(); err != nil {
+		if err := f.copyZipEntry(ctx, writer, entry, buf); err != nil {
 			return fmt.Errorf("write file content: %w", err)
 		}
 	}
 	return nil
+}
+
+func (f *Files) copyZipEntry(ctx context.Context, dst io.Writer, entry model.ZipEntry, buf []byte) error {
+	reader, _, err := storage.OpenFrom(ctx, f.storage, entry.Backend, entry.StorageKey)
+	if err != nil {
+		return fmt.Errorf("open file content: %w", err)
+	}
+	defer reader.Close()
+	return copyWithContext(ctx, dst, reader, buf)
+}
+
+// copyWithContext 按固定分块流式复制，在每次读写块之间检查 ctx.Done()，任意写错误立即返回终止。
+func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader, buf []byte) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		nr, rerr := src.Read(buf)
+		if nr > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+			nw, werr := dst.Write(buf[:nr])
+			if werr != nil {
+				return werr
+			}
+			if nw != nr {
+				return io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				return nil
+			}
+			return rerr
+		}
+	}
 }
 
 // getCompressionMethod 按扩展名挑压缩方式：已压缩的格式直接 Store，其余 Deflate。

@@ -27,6 +27,7 @@ type Config struct {
 	RefreshTTL                   time.Duration
 	DefaultQuotaBytes            int64
 	TrashRetention               time.Duration
+	MaxConcurrentZips            int
 	CORSOrigins                  []string
 	AutoTierThreshold            int64
 	AutoTierMinSize              int64
@@ -60,6 +61,10 @@ func Load() (*Config, error) {
 	if err != nil || defaultQuota < 0 {
 		return nil, fmt.Errorf("parse NETDISK_DEFAULT_QUOTA_BYTES: must be non-negative integer")
 	}
+	maxConcurrentZips, err := strconv.Atoi(envOr("NETDISK_MAX_CONCURRENT_ZIPS", "4"))
+	if err != nil || maxConcurrentZips <= 0 {
+		return nil, fmt.Errorf("parse NETDISK_MAX_CONCURRENT_ZIPS: must be positive integer")
+	}
 	autoTierThreshold, err := strconv.ParseInt(envOr("NETDISK_AUTO_TIER_THRESHOLD", "0"), 10, 64)
 	if err != nil || autoTierThreshold < 0 {
 		return nil, fmt.Errorf("parse NETDISK_AUTO_TIER_THRESHOLD: must be non-negative integer")
@@ -85,6 +90,7 @@ func Load() (*Config, error) {
 		RefreshTTL:        refreshTTL,
 		DefaultQuotaBytes: defaultQuota,
 		TrashRetention:    trashRetention,
+		MaxConcurrentZips: maxConcurrentZips,
 		CORSOrigins:       corsOrigins,
 		AutoTierThreshold: autoTierThreshold,
 		AutoTierMinSize:   autoTierMinSize,

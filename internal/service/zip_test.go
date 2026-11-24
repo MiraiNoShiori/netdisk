@@ -11,7 +11,9 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/MiraiNoShiori/netdisk/internal/model"
 	"github.com/MiraiNoShiori/netdisk/internal/repository"
@@ -235,4 +237,256 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+type zipTestStorage struct {
+	openFn func(ctx context.Context, key string) (io.ReadSeekCloser, storage.ObjectInfo, error)
+}
+
+func (s *zipTestStorage) Put(context.Context, string, io.Reader, int64) (string, error) {
+	return "", errors.New("not implemented")
+}
+
+func (s *zipTestStorage) Open(ctx context.Context, key string) (io.ReadSeekCloser, storage.ObjectInfo, error) {
+	return s.openFn(ctx, key)
+}
+
+func (s *zipTestStorage) Concat(context.Context, string, []string) (string, int64, error) {
+	return "", 0, errors.New("not implemented")
+}
+
+func (s *zipTestStorage) Delete(context.Context, string) error {
+	return errors.New("not implemented")
+}
+
+func (s *zipTestStorage) Stat(context.Context, string) (storage.ObjectInfo, error) {
+	return storage.ObjectInfo{}, errors.New("not implemented")
+}
+
+type chunkedTestReader struct {
+	totalChunks int
+	chunkSize   int
+	fillByte    byte
+	reads       atomic.Int32
+	closed      atomic.Bool
+	onRead      func(readNum int32)
+}
+
+func (r *chunkedTestReader) Read(p []byte) (int, error) {
+	n := r.reads.Add(1)
+	if int(n) > r.totalChunks {
+		return 0, io.EOF
+	}
+	size := r.chunkSize
+	if size > len(p) {
+		size = len(p)
+	}
+	for i := 0; i < size; i++ {
+		p[i] = r.fillByte
+	}
+	if r.onRead != nil {
+		r.onRead(n)
+	}
+	return size, nil
+}
+
+func (r *chunkedTestReader) Seek(int64, int) (int64, error) {
+	return 0, errors.New("not implemented")
+}
+
+func (r *chunkedTestReader) Close() error {
+	r.closed.Store(true)
+	return nil
+}
+
+func TestZipEarlyCloseStopsProducerAndReleasesSlot(t *testing.T) {
+	const totalChunks = 64
+	firstReader := &chunkedTestReader{totalChunks: totalChunks, chunkSize: zipCopyBufSize, fillByte: 'A'}
+	var secondOpened atomic.Bool
+
+	st := &zipTestStorage{
+		openFn: func(_ context.Context, key string) (io.ReadSeekCloser, storage.ObjectInfo, error) {
+			switch key {
+			case "k1":
+				return firstReader, storage.ObjectInfo{Key: key, Size: int64(totalChunks * zipCopyBufSize)}, nil
+			case "k2":
+				secondOpened.Store(true)
+				return &chunkedTestReader{totalChunks: 1, chunkSize: 16, fillByte: 'B'}, storage.ObjectInfo{Key: key, Size: 16}, nil
+			default:
+				return nil, storage.ObjectInfo{}, storage.ErrNotFound
+			}
+		},
+	}
+
+	files := NewFiles(nil, st, "local", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	files.SetMaxConcurrentZips(1)
+
+	now := time.Now()
+	entries := []model.ZipEntry{
+		{RelPath: "docs", IsDir: true, UpdatedAt: now},
+		{RelPath: "docs/big.jpg", IsDir: false, UpdatedAt: now, Backend: "local", StorageKey: "k1"},
+		{RelPath: "docs/second.txt", IsDir: false, UpdatedAt: now, Backend: "local", StorageKey: "k2"},
+	}
+
+	z, err := files.openZipEntries(context.Background(), "docs.zip", entries)
+	if err != nil {
+		t.Fatalf("openZipEntries: %v", err)
+	}
+
+	// 只读一小段即关闭读端，模拟客户端断连后 handler 提前返回。
+	head := make([]byte, 16)
+	if _, err := io.ReadFull(z.Content, head); err != nil {
+		t.Fatalf("读 zip 头部: %v", err)
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- z.Content.Close()
+	}()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close 返回错误: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close 超时：生产端可能阻塞在 pipe 写入或发生 goroutine 泄漏")
+	}
+
+	if !firstReader.closed.Load() {
+		t.Error("底层存储 reader 未关闭")
+	}
+	if got := firstReader.reads.Load(); got >= totalChunks {
+		t.Errorf("生产端未在写错误后尽快停止：reads=%d, totalChunks=%d", got, totalChunks)
+	}
+	if secondOpened.Load() {
+		t.Error("写错误后仍继续打开了下一个条目，未将写错误视为终止条件")
+	}
+
+	// 并发槽位应已释放，能够立即开启新的打包。
+	z2, err := files.openZipEntries(context.Background(), "empty.zip", []model.ZipEntry{{RelPath: "empty", IsDir: true, UpdatedAt: now}})
+	if err != nil {
+		t.Fatalf("关闭后槽位未释放: %v", err)
+	}
+	defer z2.Content.Close()
+	if _, err := io.ReadAll(z2.Content); err != nil {
+		t.Fatalf("读取第二次 zip: %v", err)
+	}
+}
+
+func TestZipContextCancelStopsBetweenChunks(t *testing.T) {
+	const totalChunks = 128
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reader := &chunkedTestReader{
+		totalChunks: totalChunks,
+		chunkSize:   zipCopyBufSize,
+		fillByte:    0, // 高度可压缩数据，确保 flate 缓冲期间也能靠分块间 ctx 检查及时停止
+		onRead: func(readNum int32) {
+			if readNum == 2 {
+				cancel()
+			}
+		},
+	}
+
+	st := &zipTestStorage{
+		openFn: func(_ context.Context, key string) (io.ReadSeekCloser, storage.ObjectInfo, error) {
+			return reader, storage.ObjectInfo{Key: key, Size: int64(totalChunks * zipCopyBufSize)}, nil
+		},
+	}
+
+	files := NewFiles(nil, st, "local", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	files.SetMaxConcurrentZips(1)
+
+	now := time.Now()
+	entries := []model.ZipEntry{
+		{RelPath: "docs", IsDir: true, UpdatedAt: now},
+		{RelPath: "docs/zeros.txt", IsDir: false, UpdatedAt: now, Backend: "local", StorageKey: "zeros"},
+	}
+
+	z, err := files.openZipEntries(ctx, "docs.zip", entries)
+	if err != nil {
+		t.Fatalf("openZipEntries: %v", err)
+	}
+
+	_, readErr := io.ReadAll(z.Content)
+	if !errors.Is(readErr, context.Canceled) {
+		t.Fatalf("期望返回 context.Canceled，实得 %v", readErr)
+	}
+	if err := z.Content.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if got := reader.reads.Load(); got > 2 {
+		t.Errorf("ctx 取消后仍继续读取了后续分块：reads=%d, want <= 2", got)
+	}
+	if !reader.closed.Load() {
+		t.Error("ctx 取消后底层存储 reader 未关闭")
+	}
+
+	// 槽位应已归还。
+	z2, err := files.openZipEntries(context.Background(), "ok.zip", []model.ZipEntry{{RelPath: "ok", IsDir: true, UpdatedAt: now}})
+	if err != nil {
+		t.Fatalf("取消后槽位未归还: %v", err)
+	}
+	defer z2.Content.Close()
+	if _, err := io.ReadAll(z2.Content); err != nil {
+		t.Fatalf("读取新 zip: %v", err)
+	}
+}
+
+func TestZipBoundedConcurrencySemaphore(t *testing.T) {
+	st := &zipTestStorage{
+		openFn: func(_ context.Context, key string) (io.ReadSeekCloser, storage.ObjectInfo, error) {
+			return &chunkedTestReader{totalChunks: 4, chunkSize: zipCopyBufSize, fillByte: 'Z'}, storage.ObjectInfo{Key: key, Size: int64(4 * zipCopyBufSize)}, nil
+		},
+	}
+
+	files := NewFiles(nil, st, "local", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	files.SetMaxConcurrentZips(2)
+
+	now := time.Now()
+	entries := []model.ZipEntry{
+		{RelPath: "dir", IsDir: true, UpdatedAt: now},
+		{RelPath: "dir/file.jpg", IsDir: false, UpdatedAt: now, Backend: "local", StorageKey: "k"},
+	}
+
+	z1, err := files.openZipEntries(context.Background(), "1.zip", entries)
+	if err != nil {
+		t.Fatalf("第 1 个 zip 应成功: %v", err)
+	}
+	defer z1.Content.Close()
+
+	z2, err := files.openZipEntries(context.Background(), "2.zip", entries)
+	if err != nil {
+		t.Fatalf("第 2 个 zip 应成功: %v", err)
+	}
+	defer z2.Content.Close()
+
+	if _, err := files.openZipEntries(context.Background(), "3.zip", entries); !errors.Is(err, ErrTooManyZips) {
+		t.Fatalf("超出并发上限时应返回 ErrTooManyZips，实得 %v", err)
+	}
+
+	// 释放第 1 个流后，第 3 个应立刻允许进入并完整产出合法 zip。
+	if err := z1.Content.Close(); err != nil {
+		t.Fatalf("关闭 z1: %v", err)
+	}
+
+	z3, err := files.openZipEntries(context.Background(), "3.zip", entries)
+	if err != nil {
+		t.Fatalf("释放槽位后第 3 个 zip 应成功: %v", err)
+	}
+	defer z3.Content.Close()
+
+	raw, err := io.ReadAll(z3.Content)
+	if err != nil {
+		t.Fatalf("读取 z3 失败: %v", err)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(raw), int64(len(raw)))
+	if err != nil {
+		t.Fatalf("z3 不是合法压缩包: %v", err)
+	}
+	if len(zr.File) != 2 {
+		t.Fatalf("z3 条目数 = %d, want 2", len(zr.File))
+	}
 }

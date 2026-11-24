@@ -88,6 +88,7 @@ func run(logger *slog.Logger) error {
 	auth := service.NewAuthWithOptions(store, tokens, cfg.RefreshTTL, cfg.DefaultQuotaBytes)
 	files := service.NewFiles(store, blobStore, cfg.StorageDriver, logger)
 	files.AllowGlobalInstantUpload = cfg.AllowGlobalInstantUpload
+	files.SetMaxConcurrentZips(cfg.MaxConcurrentZips)
 	uploads := service.NewUploads(store, blobStore, cfg.StorageDriver, logger)
 	var workers sync.WaitGroup
 	// HTTP 和 NFS 各自最多上报一次，停机期间上报也不会阻塞。

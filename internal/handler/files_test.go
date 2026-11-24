@@ -10,7 +10,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MiraiNoShiori/netdisk/internal/httpx"
 	"github.com/MiraiNoShiori/netdisk/internal/middleware"
+	"github.com/MiraiNoShiori/netdisk/internal/service"
 	"github.com/google/uuid"
 )
 
@@ -84,5 +86,23 @@ func TestContentDispositionUnicodeFallback(t *testing.T) {
 		if got != mode+`; filename="- -.pdf"; filename*=UTF-8''%E5%9B%BE%20%E7%89%87.pdf` {
 			t.Fatal(got)
 		}
+	}
+}
+
+func TestFailServiceTooManyZips(t *testing.T) {
+	s := Server{deps: Deps{Logger: slog.Default()}}
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/files/00000000-0000-0000-0000-000000000001/zip", nil)
+	w := httptest.NewRecorder()
+
+	s.failService(w, r, service.ErrTooManyZips)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+	if got := w.Header().Get("Retry-After"); got != "5" {
+		t.Fatalf("Retry-After = %q, want 5", got)
+	}
+	if !strings.Contains(w.Body.String(), httpx.CodeTooBusy) {
+		t.Fatalf("body = %s, want code %q", w.Body.String(), httpx.CodeTooBusy)
 	}
 }

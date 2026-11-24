@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -390,15 +391,19 @@ func (s *Server) downloadZip(w http.ResponseWriter, r *http.Request) {
 
 	z, err := s.deps.Files.OpenZip(r.Context(), uid, id)
 	if err != nil {
+		if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
+			return
+		}
 		s.failService(w, r, err)
 		return
 	}
-	// 读端提前退出时 Close，让写端的 pw.Write 立刻失败，避免遍历 goroutine 阻塞在管道上。
+	// 读端提前退出时立即 Close，取消打包上下文、关闭管道并等待写端退出，避免 goroutine 泄漏。
 	defer z.Content.Close()
 
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", contentDisposition(z.Name))
 	if _, err := io.Copy(w, z.Content); err != nil {
+		_ = z.Content.Close()
 		// 响应头已发出，状态码无法修改，只记日志。
 		s.deps.Logger.Warn("stream folder zip", "node_id", id, "error", err)
 	}

@@ -18,6 +18,7 @@ const (
 	CodeConflict              = "conflict"
 	CodeQuotaExceeded         = "quota_exceeded"
 	CodeRateLimited           = "rate_limited"
+	CodeTooBusy               = "too_busy"
 	CodeSharePasswordRequired = "share_password_required"
 	CodeSharePasswordInvalid  = "share_password_invalid"
 	CodeShareLimitReached     = "share_limit_reached"

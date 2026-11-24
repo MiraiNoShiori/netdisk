@@ -79,6 +79,9 @@ func (s *Server) failService(w http.ResponseWriter, r *http.Request, err error) 
 	case errors.Is(err, service.ErrNotAFile), errors.Is(err, service.ErrNotADirectory):
 		// 目标类型不匹配（文件夹当文件、文件当文件夹）返回 400。
 		httpx.Fail(w, r, s.deps.Logger, httpx.Invalid(err.Error()))
+	case errors.Is(err, service.ErrTooManyZips):
+		w.Header().Set("Retry-After", "5")
+		httpx.Fail(w, r, s.deps.Logger, httpx.New(http.StatusServiceUnavailable, httpx.CodeTooBusy, "当前并发打包任务过多，请稍后重试"))
 	default:
 		// 未识别的错误按 500 处理，细节只写日志。
 		httpx.Fail(w, r, s.deps.Logger, err)
